@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "OnlyFans Downloader",
+  "version": "6.0.0",
+  "description": "A modern downloader for OnlyFans content with improved performance and user experience",
+  "icons": {
+    "128": "/assets/icon128.png",
+    "48": "/assets/icon48.png",
+    "16": "/assets/icon16.png"
+  },
+  "action": {
+    "default_icon": "/assets/icon16.png",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.onlyfans.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "permissions": [
+    "storage",
+    "downloads",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "*://*.onlyfans.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
