@@ -15,6 +15,8 @@ class OnlyFansDownloader {
     this.uniqueClass = this.generateUniqueClass();
     this.observer = null;
     this.isInitialized = false;
+    this.photoSwipeButtonInteracting = false;
+    this.photoSwipeUpdateTimeout = null;
   }
 
   /**
@@ -25,9 +27,9 @@ class OnlyFansDownloader {
       await this.loadSettings();
       this.setupEventListeners();
       this.setupVideoLoadHandler();
-      this.startObserving();
+      // this.startObserving(); // Disabled - using setupMutationObserver instead
       
-      // Setup MutationObserver for dynamic content
+      // Setup MutationObserver for content detection and PhotoSwipe
       this.setupMutationObserver();
       
       // Setup infinite scroll and lazy loading handlers
@@ -44,6 +46,7 @@ class OnlyFansDownloader {
       this.setupSwipeHandling();
       this.setupDirectImageClickHandling();
       this.setupThumbnailNavigationHandling();
+      this.setupMediaTypeChangeDetection();
       
       this.isInitialized = true;
       console.log('OnlyFans Downloader initialized successfully');
@@ -583,15 +586,7 @@ class OnlyFansDownloader {
       const videoUrl = this.extractVideoUrl(element, element.closest('.b-post'));
       if (videoUrl) {
         console.log('✅ Found video URL on retry:', videoUrl);
-        const creatorUsername = this.getCreatorUsername(element);
-        const downloadData = [[videoUrl, creatorUsername, 'download video']];
-        
-        // Remove existing buttons and add new one
-        const existingButtons = element.querySelectorAll(`.${this.uniqueClass}`);
-        existingButtons.forEach(btn => btn.remove());
-        
-        const buttonContainer = this.createDownloadButtonContainer(downloadData);
-        element.appendChild(buttonContainer);
+        this.createVideoDownloadButton(element, videoUrl);
       }
     } else {
       // Handle standalone video
@@ -600,13 +595,7 @@ class OnlyFansDownloader {
         const videoUrl = this.extractVideoUrlFromElement(video);
         if (videoUrl) {
           console.log('✅ Found video URL on retry:', videoUrl);
-          const creatorUsername = this.getCreatorUsername(video);
-          const downloadData = [[videoUrl, creatorUsername, 'download video']];
-          
-          if (!element.querySelector(`.${this.uniqueClass}`)) {
-            const buttonContainer = this.createDownloadButtonContainer(downloadData);
-            element.appendChild(buttonContainer);
-          }
+          this.createVideoDownloadButton(element, videoUrl);
         }
       }
     }
@@ -886,7 +875,7 @@ class OnlyFansDownloader {
   createDownloadButtonContainer(mediaToDownload) {
     const container = document.createElement('div');
     container.className = this.uniqueClass;
-    container.style.cssText = 'margin: 10px 0; display: flex; gap: 5px; flex-wrap: wrap;';
+    container.style.cssText = 'margin: 10px 0; display: flex; gap: 5px; flex-wrap: wrap; position: relative; z-index: 2000; pointer-events: auto;';
     
     // Group media by type and create smart buttons
     const mediaGroups = this.groupMediaByType(mediaToDownload);
@@ -954,6 +943,10 @@ class OnlyFansDownloader {
       cursor: pointer;
       font-size: 12px;
       transition: background-color 0.2s;
+      position: relative;
+      z-index: 2001;
+      pointer-events: auto;
+      user-select: none;
     `;
     
     button.addEventListener('mouseenter', () => {
@@ -967,6 +960,12 @@ class OnlyFansDownloader {
     button.addEventListener('click', async (e) => {
       e.preventDefault();
       e.stopPropagation();
+      e.stopImmediatePropagation();
+      
+      // Prevent PhotoSwipe from handling this click
+      if (e.cancelBubble !== undefined) {
+        e.cancelBubble = true;
+      }
       
       try {
         button.textContent = '⏳ Downloading...';
@@ -1182,14 +1181,25 @@ class OnlyFansDownloader {
    * Observe PhotoSwipe slide changes
    */
   observePhotoSwipeSlideChanges(viewer) {
+    // Only observe if not already observing
+    if (this.photoSwipeSlideObserver) {
+      return;
+    }
+    
     const slideObserver = new MutationObserver((mutations) => {
+      // Don't update if user is interacting with buttons
+      if (this.photoSwipeButtonInteracting) {
+        return;
+      }
+      
       mutations.forEach((mutation) => {
         if (mutation.type === 'attributes' && mutation.attributeName === 'aria-hidden') {
           const slide = mutation.target;
           if (slide.getAttribute('aria-hidden') === 'false') {
+            // Increased delay to prevent flickering
             setTimeout(() => {
               this.updatePhotoSwipeButtons();
-            }, 100);
+            }, 300);
           }
         }
       });
@@ -1200,12 +1210,38 @@ class OnlyFansDownloader {
       subtree: true,
       attributeFilter: ['aria-hidden']
     });
+    
+    this.photoSwipeSlideObserver = slideObserver;
   }
 
   /**
    * Update PhotoSwipe buttons for current slide
    */
   updatePhotoSwipeButtons() {
+    // Don't update if user is interacting with buttons
+    if (this.photoSwipeButtonInteracting) {
+      return;
+    }
+    
+    // Debounce to prevent rapid updates
+    if (this.photoSwipeUpdateTimeout) {
+      clearTimeout(this.photoSwipeUpdateTimeout);
+    }
+    
+    this.photoSwipeUpdateTimeout = setTimeout(() => {
+      this._updatePhotoSwipeButtonsInternal();
+    }, 300);
+  }
+
+  /**
+   * Internal method to update PhotoSwipe buttons
+   */
+  _updatePhotoSwipeButtonsInternal() {
+    // Don't update if user is interacting with buttons
+    if (this.photoSwipeButtonInteracting) {
+      return;
+    }
+    
     const viewer = document.querySelector('.pswp--open');
     if (!viewer) {
       return;
@@ -1215,10 +1251,6 @@ class OnlyFansDownloader {
     if (!topBar) {
       return;
     }
-    
-    // Remove existing download buttons
-    const existingButtons = topBar.querySelectorAll(`.${this.uniqueClass}`);
-    existingButtons.forEach(btn => btn.remove());
     
     // Get current slide
     const activeSlide = viewer.querySelector('.pswp__item[aria-hidden="false"]');
@@ -1250,15 +1282,87 @@ class OnlyFansDownloader {
       }
     }
     
-    if (mediaUrl) {
-      console.log('✅ Found media URL in PhotoSwipe slide:', mediaUrl);
-      const downloadData = [[mediaUrl, creatorUsername, buttonLabel]];
-      const buttonContainer = this.createDownloadButtonContainer(downloadData);
-      buttonContainer.classList.add(this.uniqueClass);
-      topBar.insertBefore(buttonContainer, topBar.firstChild);
-    } else {
+    if (!mediaUrl) {
       console.log('⚠️ No media URL found in current PhotoSwipe slide');
+      return;
     }
+    
+    // Check if button already exists with the same URL
+    const existingButtons = topBar.querySelectorAll(`.${this.uniqueClass}`);
+    let needsUpdate = true;
+    
+    if (existingButtons.length > 0) {
+      // Check if existing button has the same URL
+      const existingButton = existingButtons[0].querySelector('button');
+      if (existingButton) {
+        // Store current URL in data attribute to compare
+        const existingUrl = existingButton.getAttribute('data-media-url');
+        if (existingUrl === mediaUrl) {
+          // Same URL, don't recreate
+          needsUpdate = false;
+        }
+      }
+    }
+    
+    if (!needsUpdate) {
+      return;
+    }
+    
+    // Remove existing download buttons only if we need to update
+    existingButtons.forEach(btn => btn.remove());
+    
+    console.log('✅ Found media URL in PhotoSwipe slide:', mediaUrl);
+    const downloadData = [[mediaUrl, creatorUsername, buttonLabel]];
+    const buttonContainer = this.createDownloadButtonContainer(downloadData);
+    buttonContainer.classList.add(this.uniqueClass);
+    
+    // Store media URL in button for comparison
+    const buttons = buttonContainer.querySelectorAll('button');
+    buttons.forEach(btn => {
+      btn.setAttribute('data-media-url', mediaUrl);
+    });
+    
+    // Add PhotoSwipe-specific styling for better visibility and clickability
+    // Use setProperty to ensure styles are applied correctly
+    buttonContainer.style.setProperty('position', 'relative', 'important');
+    buttonContainer.style.setProperty('z-index', '2000', 'important');
+    buttonContainer.style.setProperty('pointer-events', 'auto', 'important');
+    buttonContainer.style.setProperty('margin-left', '10px', 'important');
+    buttonContainer.style.setProperty('margin-right', '10px', 'important');
+    buttonContainer.style.setProperty('display', 'flex', 'important');
+    buttonContainer.style.setProperty('gap', '5px', 'important');
+    
+    // Ensure all buttons inside are clickable and add interaction handlers
+    buttons.forEach(btn => {
+      btn.style.setProperty('position', 'relative', 'important');
+      btn.style.setProperty('z-index', '2001', 'important');
+      btn.style.setProperty('pointer-events', 'auto', 'important');
+      btn.style.setProperty('cursor', 'pointer', 'important');
+      
+      // Prevent updates when user is interacting with button
+      btn.addEventListener('mouseenter', () => {
+        this.photoSwipeButtonInteracting = true;
+      });
+      
+      btn.addEventListener('mouseleave', () => {
+        // Small delay before allowing updates again
+        setTimeout(() => {
+          this.photoSwipeButtonInteracting = false;
+        }, 200);
+      });
+      
+      btn.addEventListener('mousedown', () => {
+        this.photoSwipeButtonInteracting = true;
+      });
+      
+      btn.addEventListener('mouseup', () => {
+        setTimeout(() => {
+          this.photoSwipeButtonInteracting = false;
+        }, 200);
+      });
+    });
+    
+    topBar.insertBefore(buttonContainer, topBar.firstChild);
   }
 
   /**
@@ -1389,9 +1493,17 @@ class OnlyFansDownloader {
       const creatorUsername = this.getCreatorUsername(post);
       const downloadData = [[mediaUrl, creatorUsername, buttonLabel]];
       const buttonContainer = this.createDownloadButtonContainer(downloadData);
-      post.appendChild(buttonContainer);
       
-      console.log(`✅ Updated buttons for media item ${currentIndex + 1}/${totalItems}`);
+      // Add button to the post's tools container (same location as image buttons)
+      const toolsContainer = post.querySelector('.b-post__tools');
+      if (toolsContainer) {
+        toolsContainer.appendChild(buttonContainer);
+        console.log(`✅ Updated buttons in tools container for media item ${currentIndex + 1}/${totalItems}`);
+      } else {
+        // Fallback: append to post if tools container doesn't exist
+        post.appendChild(buttonContainer);
+        console.log(`✅ Updated buttons in post (no tools container) for media item ${currentIndex + 1}/${totalItems}`);
+      }
     }
   }
 
@@ -1499,6 +1611,23 @@ class OnlyFansDownloader {
         }, 1000);
       }
     }, true);
+    
+    // Listen for clicks on images that might reveal videos
+    document.addEventListener('click', (event) => {
+      const target = event.target;
+      const clickedImage = target.closest('img.b-post__media__img');
+      
+      if (clickedImage) {
+        const post = clickedImage.closest('.b-post');
+        if (post) {
+          console.log('🖼️ Image clicked, checking for video activation...');
+          // Wait a bit for video to appear after click
+          setTimeout(() => {
+            this.refreshButtonsOnMediaChange(post);
+          }, 500);
+        }
+      }
+    }, true);
   }
 
   /**
@@ -1516,14 +1645,11 @@ class OnlyFansDownloader {
       const videoUrl = this.extractVideoUrlFromElement(video);
       if (videoUrl) {
         console.log('✅ Found video URL on force detection:', videoUrl);
-        const creatorUsername = this.getCreatorUsername(video);
-        const downloadData = [[videoUrl, creatorUsername, 'download video']];
         
-        // Find the appropriate parent to add the button
-        const parent = video.closest('.b-post, .b-chat__message, .video-wrapper') || video.parentElement;
-        if (parent && !parent.querySelector(`.${this.uniqueClass}`)) {
-          const buttonContainer = this.createDownloadButtonContainer(downloadData);
-          parent.appendChild(buttonContainer);
+        // Find the appropriate parent container (video wrapper, player, etc.)
+        const parent = video.closest('.video-wrapper, .video-js, [class*="videoPlayer-"]') || video.parentElement;
+        if (parent) {
+          this.createVideoDownloadButton(parent, videoUrl);
         }
       }
     });
@@ -1536,14 +1662,17 @@ class OnlyFansDownloader {
     const videoUrl = this.extractVideoUrlFromElement(video);
     if (!videoUrl) return;
     
-    const creatorUsername = this.getCreatorUsername(video);
-    const downloadData = [[videoUrl, creatorUsername, 'download video']];
-    
-    // Check if button already exists
-    const parent = video.parentElement;
-    if (parent && !parent.querySelector(`.${this.uniqueClass}`)) {
-      const buttonContainer = this.createDownloadButtonContainer(downloadData);
-      parent.appendChild(buttonContainer);
+    // Find the appropriate parent container (video wrapper, player, etc.)
+    const parent = video.closest('.video-wrapper, .video-js, [class*="videoPlayer-"]') || video.parentElement;
+    if (parent) {
+      // Check if button already exists in the post
+      const post = parent.closest('.b-post');
+      if (post && !post.querySelector(`.${this.uniqueClass}`)) {
+        this.createVideoDownloadButton(parent, videoUrl);
+      } else if (!post) {
+        // If no post found, still try to add button
+        this.createVideoDownloadButton(parent, videoUrl);
+      }
     }
   }
 
@@ -1553,6 +1682,15 @@ class OnlyFansDownloader {
   handleVideoPlay(video) {
     // Same as handleVideoLoad but triggered on play
     this.handleVideoLoad(video);
+    
+    // Also refresh buttons for the post when video starts playing
+    const post = video.closest('.b-post');
+    if (post) {
+      console.log('▶️ Video started playing, refreshing buttons...');
+      setTimeout(() => {
+        this.refreshButtonsOnMediaChange(post);
+      }, 300);
+    }
   }
 
   /**
@@ -2106,18 +2244,42 @@ class OnlyFansDownloader {
    * Create video download button
    */
   createVideoDownloadButton(container, videoUrl) {
-    const creatorUsername = this.getCreatorUsername(container);
+    // Find the parent post element
+    const post = container.closest('.b-post');
+    if (!post) {
+      console.log('⚠️ No post found for video button, appending to container');
+      const creatorUsername = this.getCreatorUsername(container);
+      const downloadData = [[videoUrl, creatorUsername, 'download video']];
+      const buttonContainer = this.createDownloadButtonContainer(downloadData);
+      container.appendChild(buttonContainer);
+      return;
+    }
+    
+    // Check if button already exists in the post
+    if (post.querySelector(`.${this.uniqueClass}`)) {
+      console.log('⚠️ Button already exists in post, skipping');
+      return;
+    }
+    
+    const creatorUsername = this.getCreatorUsername(post);
     const downloadData = [[videoUrl, creatorUsername, 'download video']];
     
-    // Remove existing download buttons
-    const existingButtons = container.querySelectorAll(`.${this.uniqueClass}`);
+    // Remove existing download buttons from the post
+    const existingButtons = post.querySelectorAll(`.${this.uniqueClass}`);
     existingButtons.forEach(btn => btn.remove());
     
-    // Add new download button
+    // Add button to the post's tools container (same location as image buttons)
     const buttonContainer = this.createDownloadButtonContainer(downloadData);
-    container.appendChild(buttonContainer);
+    const toolsContainer = post.querySelector('.b-post__tools');
     
-    console.log('✅ Created video download button for:', videoUrl);
+    if (toolsContainer) {
+      toolsContainer.appendChild(buttonContainer);
+      console.log('✅ Created video download button in tools container for:', videoUrl);
+    } else {
+      // Fallback: append to post if tools container doesn't exist
+      post.appendChild(buttonContainer);
+      console.log('✅ Created video download button in post (no tools container) for:', videoUrl);
+    }
   }
 
   /**
@@ -2269,9 +2431,17 @@ class OnlyFansDownloader {
       const creatorUsername = this.getCreatorUsername(post);
       const downloadData = [[mediaUrl, creatorUsername, buttonLabel]];
       const buttonContainer = this.createDownloadButtonContainer(downloadData);
-      post.appendChild(buttonContainer);
       
-      console.log('✅ Updated buttons for current carousel item:', mediaUrl);
+      // Add button to the post's tools container (same location as image buttons)
+      const toolsContainer = post.querySelector('.b-post__tools');
+      if (toolsContainer) {
+        toolsContainer.appendChild(buttonContainer);
+        console.log('✅ Updated buttons in tools container for current carousel item:', mediaUrl);
+      } else {
+        // Fallback: append to post if tools container doesn't exist
+        post.appendChild(buttonContainer);
+        console.log('✅ Updated buttons in post (no tools container) for current carousel item:', mediaUrl);
+      }
     }
   }
 
@@ -2379,9 +2549,17 @@ class OnlyFansDownloader {
       const creatorUsername = this.getCreatorUsername(post);
       const downloadData = [[mediaUrl, creatorUsername, buttonLabel]];
       const buttonContainer = this.createDownloadButtonContainer(downloadData);
-      post.appendChild(buttonContainer);
       
-      console.log(`✅ Updated buttons for clicked image ${imageIndex + 1}/${totalImages}:`, mediaUrl);
+      // Add button to the post's tools container (same location as image buttons)
+      const toolsContainer = post.querySelector('.b-post__tools');
+      if (toolsContainer) {
+        toolsContainer.appendChild(buttonContainer);
+        console.log(`✅ Updated buttons in tools container for clicked image ${imageIndex + 1}/${totalImages}:`, mediaUrl);
+      } else {
+        // Fallback: append to post if tools container doesn't exist
+        post.appendChild(buttonContainer);
+        console.log(`✅ Updated buttons in post (no tools container) for clicked image ${imageIndex + 1}/${totalImages}:`, mediaUrl);
+      }
     }
   }
 
@@ -2444,33 +2622,159 @@ class OnlyFansDownloader {
   }
 
   /**
-   * Setup comprehensive MutationObserver for dynamic content
+   * Setup media type change detection (image to video)
    */
-  setupMutationObserver() {
-    console.log('👁️ Setting up MutationObserver for dynamic content...');
+  setupMediaTypeChangeDetection() {
+    console.log('🔄 Setting up media type change detection...');
     
-    // Create main observer for new posts and content changes
-    const mainObserver = new MutationObserver((mutations) => {
-      let hasNewContent = false;
-      let hasRemovedContent = false;
-      
+    // Watch for video elements appearing in posts (when images transform to videos)
+    const mediaChangeObserver = new MutationObserver((mutations) => {
       mutations.forEach((mutation) => {
-        // Check for added nodes (new posts, new media)
         if (mutation.type === 'childList') {
           mutation.addedNodes.forEach((node) => {
             if (node.nodeType === Node.ELEMENT_NODE) {
-              // Check if new posts were added
-              if (node.classList && node.classList.contains('b-post')) {
-                console.log('📝 New post detected, adding buttons...');
-                hasNewContent = true;
-                this.handleNewPost(node);
+              // Check if a video element was added
+              if (node.tagName === 'VIDEO' || node.querySelector?.('video')) {
+                const post = node.closest('.b-post');
+                if (post) {
+                  console.log('🎬 Video element detected in post, refreshing buttons...');
+                  setTimeout(() => {
+                    this.refreshButtonsOnMediaChange(post);
+                  }, 300);
+                }
               }
               
-              // Check if new media was added to existing posts
-              if (node.querySelector && (node.querySelector('.b-post__media__img') || node.querySelector('.b-post__media__video'))) {
-                console.log('🖼️ New media detected, updating buttons...');
+              // Check if video player containers were added
+              if (node.classList?.contains('video-wrapper') ||
+                  node.classList?.contains('video-js') ||
+                  node.classList?.contains('vjs-fluid') ||
+                  (node.className && typeof node.className === 'string' && 
+                   (node.className.includes('videoPlayer-') || node.className.includes('vjs-')))) {
+                const post = node.closest('.b-post');
+                if (post) {
+                  console.log('🎬 Video player container detected in post, refreshing buttons...');
+                  setTimeout(() => {
+                    this.refreshButtonsOnMediaChange(post);
+                  }, 300);
+                }
+              }
+            }
+          });
+        }
+        
+        // Watch for attribute changes that might indicate video activation
+        if (mutation.type === 'attributes') {
+          const target = mutation.target;
+          
+          // Check if video started playing or became visible
+          if (target.tagName === 'VIDEO' && 
+              (mutation.attributeName === 'src' || 
+               mutation.attributeName === 'style' ||
+               mutation.attributeName === 'class')) {
+            const post = target.closest('.b-post');
+            if (post) {
+              console.log('🎬 Video attribute changed, refreshing buttons...');
+              setTimeout(() => {
+                this.refreshButtonsOnMediaChange(post);
+              }, 300);
+            }
+          }
+        }
+      });
+    });
+    
+    // Observe all posts for video elements appearing
+    mediaChangeObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['src', 'style', 'class']
+    });
+    
+    // Store observer reference
+    this.mediaChangeObserver = mediaChangeObserver;
+    
+    console.log('✅ Media type change detection setup complete');
+  }
+
+  /**
+   * Refresh buttons when media type changes (image to video)
+   */
+  refreshButtonsOnMediaChange(post) {
+    console.log('🔄 Refreshing buttons for media type change in post:', post);
+    
+    // Remove existing buttons
+    const existingButtons = post.querySelectorAll(`.${this.uniqueClass}`);
+    existingButtons.forEach(btn => btn.remove());
+    
+    // Check for videos first (they take priority)
+    const videos = post.querySelectorAll('video');
+    const videoWrappers = post.querySelectorAll('.video-wrapper');
+    const videoPlayers = post.querySelectorAll('.video-js, [class*="videoPlayer-"]');
+    
+    let hasVideos = false;
+    
+    // Check if any videos are actually present and visible
+    videos.forEach(video => {
+      const videoUrl = this.extractVideoUrlFromElement(video);
+      if (videoUrl) {
+        hasVideos = true;
+        const parent = video.closest('.video-wrapper, .video-js, [class*="videoPlayer-"]') || video.parentElement;
+        if (parent) {
+          this.createVideoDownloadButton(parent, videoUrl);
+        }
+      }
+    });
+    
+    // Also check video wrappers and players
+    if (videoWrappers.length > 0 || videoPlayers.length > 0) {
+      this.handleVideoPlayers();
+    }
+    
+    // If no videos found, check for images
+    if (!hasVideos) {
+      const mediaToDownload = this.extractMediaFromPost(post);
+      if (mediaToDownload.length > 0) {
+        const buttonContainer = this.createDownloadButtonContainer(mediaToDownload);
+        const toolsContainer = post.querySelector('.b-post__tools');
+        
+        if (toolsContainer) {
+          toolsContainer.appendChild(buttonContainer);
+          console.log('✅ Refreshed image buttons in tools container');
+        } else {
+          post.appendChild(buttonContainer);
+          console.log('✅ Refreshed image buttons in post (no tools container)');
+        }
+      }
+    } else {
+      console.log('✅ Refreshed video buttons');
+    }
+  }
+
+  /**
+   * Setup comprehensive MutationObserver for dynamic content
+   */
+  setupMutationObserver() {
+    console.log('👁️ Setting up MutationObserver for content detection...');
+    
+    const mainObserver = new MutationObserver((mutations) => {
+      let shouldUpdate = false;
+      let hasNewContent = false;
+      
+      mutations.forEach((mutation) => {
+        // Check for new nodes being added
+        if (mutation.type === 'childList') {
+          mutation.addedNodes.forEach(node => {
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              // Check if this is OnlyFans content
+              if (node.classList?.contains('b-post') || 
+                  node.classList?.contains('b-chat__message') ||
+                  node.querySelector?.('.b-post') ||
+                  node.querySelector?.('.b-chat__message') ||
+                  node.querySelector?.('video') ||
+                  node.querySelector?.('img.b-post__media__img')) {
                 hasNewContent = true;
-                this.handleNewMedia(node);
+                console.log('🆕 New OnlyFans content detected:', node);
               }
               
               // Check if PhotoSwipe was opened
@@ -2482,61 +2786,47 @@ class OnlyFansDownloader {
               }
             }
           });
-          
-          // Check for removed nodes (posts removed, media changed)
-          mutation.removedNodes.forEach((node) => {
-            if (node.nodeType === Node.ELEMENT_NODE) {
-              if (node.classList && node.classList.contains('b-post')) {
-                console.log('🗑️ Post removed, cleaning up...');
-                hasRemovedContent = true;
-              }
-              
-              // Check if PhotoSwipe was closed
-              if (node.classList && node.classList.contains('pswp--open')) {
-                console.log('🖼️ PhotoSwipe closed');
-              }
-            }
-          });
         }
         
-        // Check for attribute changes (media switching, carousel navigation)
+        // Check for attribute changes that might indicate content loading
         if (mutation.type === 'attributes') {
           const target = mutation.target;
-          
-          // Check for carousel/slider navigation
-          if (target.classList && (
-            target.classList.contains('active') ||
-            target.classList.contains('current') ||
-            target.getAttribute('aria-hidden') === 'false'
-          )) {
-            console.log('🔄 Media navigation detected, updating buttons...');
-            hasNewContent = true;
-            this.handleMediaNavigation(target);
-          }
           
           // Check for PhotoSwipe slide changes
           if (target.classList && target.classList.contains('pswp__item') && 
               mutation.attributeName === 'aria-hidden' && 
               target.getAttribute('aria-hidden') === 'false') {
             console.log('🖼️ PhotoSwipe slide changed, updating buttons...');
-            hasNewContent = true;
-            this.updatePhotoSwipeButtons();
+            setTimeout(() => this.updatePhotoSwipeButtons(), 100);
+          }
+          
+          // Check for general content changes
+          if (mutation.attributeName === 'class') {
+            if (target.classList?.contains('b-post') || 
+                target.classList?.contains('b-chat__message') ||
+                target.classList?.contains('video-wrapper')) {
+              shouldUpdate = true;
+            }
           }
         }
       });
-      
-      // Debounced processing of content changes
-      if (hasNewContent || hasRemovedContent) {
-        this.debouncedProcessContentChanges();
+
+      // If we detected new content, inject buttons immediately
+      if (hasNewContent) {
+        console.log('🚀 New content detected, injecting download buttons...');
+        this.injectDownloadButtons();
+        this.setupPhotoSwipeHandler();
+      } else if (shouldUpdate) {
+        this.debounce(this.injectDownloadButtons.bind(this), 500)();
       }
     });
     
-    // Start observing the entire document
+    // Observe for all content changes
     mainObserver.observe(document.body, {
-      childList: true,      // Watch for added/removed elements
-      subtree: true,        // Watch all descendants
-      attributes: true,     // Watch for attribute changes
-      attributeFilter: ['class', 'aria-hidden', 'style'] // Only watch specific attributes
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['class', 'aria-hidden']
     });
     
     // Store observer reference for cleanup
@@ -2555,8 +2845,17 @@ class OnlyFansDownloader {
     const mediaToDownload = this.extractMediaFromPost(postElement);
     if (mediaToDownload.length > 0) {
       const buttonContainer = this.createDownloadButtonContainer(mediaToDownload);
-      postElement.appendChild(buttonContainer);
-      console.log('✅ Added buttons to new post');
+      
+      // Add button to the post's tools container (same location as image buttons)
+      const toolsContainer = postElement.querySelector('.b-post__tools');
+      if (toolsContainer) {
+        toolsContainer.appendChild(buttonContainer);
+        console.log('✅ Added buttons to new post in tools container');
+      } else {
+        // Fallback: append to post if tools container doesn't exist
+        postElement.appendChild(buttonContainer);
+        console.log('✅ Added buttons to new post (no tools container)');
+      }
     }
     
     // Setup multi-media handling for the new post
@@ -2581,8 +2880,17 @@ class OnlyFansDownloader {
         
         // Add new buttons
         const buttonContainer = this.createDownloadButtonContainer(mediaToDownload);
-        post.appendChild(buttonContainer);
-        console.log('✅ Updated buttons for new media');
+        
+        // Add button to the post's tools container (same location as image buttons)
+        const toolsContainer = post.querySelector('.b-post__tools');
+        if (toolsContainer) {
+          toolsContainer.appendChild(buttonContainer);
+          console.log('✅ Updated buttons in tools container for new media');
+        } else {
+          // Fallback: append to post if tools container doesn't exist
+          post.appendChild(buttonContainer);
+          console.log('✅ Updated buttons in post (no tools container) for new media');
+        }
       }
     }
   }
@@ -2686,6 +2994,16 @@ class OnlyFansDownloader {
       console.log('🧹 Main observer disconnected');
     }
     
+    if (this.mediaChangeObserver) {
+      this.mediaChangeObserver.disconnect();
+      console.log('🧹 Media change observer disconnected');
+    }
+    
+    if (this.photoSwipeSlideObserver) {
+      this.photoSwipeSlideObserver.disconnect();
+      console.log('🧹 PhotoSwipe slide observer disconnected');
+    }
+    
     if (this.intersectionObserver) {
       this.intersectionObserver.disconnect();
       console.log('🧹 Intersection observer disconnected');
@@ -2693,6 +3011,10 @@ class OnlyFansDownloader {
     
     if (this.contentChangeTimeout) {
       clearTimeout(this.contentChangeTimeout);
+    }
+    
+    if (this.photoSwipeUpdateTimeout) {
+      clearTimeout(this.photoSwipeUpdateTimeout);
     }
   }
 
@@ -2743,8 +3065,17 @@ class OnlyFansDownloader {
           const mediaToDownload = this.extractMediaFromPost(post);
           if (mediaToDownload.length > 0) {
             const buttonContainer = this.createDownloadButtonContainer(mediaToDownload);
-            post.appendChild(buttonContainer);
-            console.log('✅ Added buttons to new post from scroll');
+            
+            // Add button to the post's tools container (same location as image buttons)
+            const toolsContainer = post.querySelector('.b-post__tools');
+            if (toolsContainer) {
+              toolsContainer.appendChild(buttonContainer);
+              console.log('✅ Added buttons to new post from scroll in tools container');
+            } else {
+              // Fallback: append to post if tools container doesn't exist
+              post.appendChild(buttonContainer);
+              console.log('✅ Added buttons to new post from scroll (no tools container)');
+            }
           }
         }
       });
@@ -2770,8 +3101,17 @@ class OnlyFansDownloader {
               const mediaToDownload = this.extractMediaFromPost(target);
               if (mediaToDownload.length > 0) {
                 const buttonContainer = this.createDownloadButtonContainer(mediaToDownload);
-                target.appendChild(buttonContainer);
-                console.log('✅ Added buttons to newly visible post');
+                
+                // Add button to the post's tools container (same location as image buttons)
+                const toolsContainer = target.querySelector('.b-post__tools');
+                if (toolsContainer) {
+                  toolsContainer.appendChild(buttonContainer);
+                  console.log('✅ Added buttons to newly visible post in tools container');
+                } else {
+                  // Fallback: append to post if tools container doesn't exist
+                  target.appendChild(buttonContainer);
+                  console.log('✅ Added buttons to newly visible post (no tools container)');
+                }
               }
             }
           }

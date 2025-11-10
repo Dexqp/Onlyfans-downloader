@@ -197,9 +197,12 @@ When reporting issues, include:
 5. **Reload OnlyFans** to apply updates
 
 ### Version History
-- **v6.0.0**: Enhanced video detection, dynamic button updates, MutationObserver
+- **v6.0.0**: Enhanced video detection, dynamic button updates (play video first to download videos), MutationObserver
 - **v5.0.0**: Modern architecture, improved performance
 - **v4.0.0**: Basic functionality, jQuery dependency
+
+### Issues to fix
+- Download button refreshes too often in fullscreen view making clicks on it inconsistent (try clicking the button a few times to trigger download if it doesn't work on first press)
 
 ## 📄 License
 
