@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "OnlyFans Downloader",
-  "version": "6.0.0",
+  "version": "6.0.3",
   "description": "A modern downloader for OnlyFans content with improved performance and user experience",
   "icons": {
     "128": "/assets/icon128.png",

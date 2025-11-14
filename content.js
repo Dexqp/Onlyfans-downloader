@@ -8,6 +8,7 @@ class OnlyFansDownloader {
     this.mediaStore = new Map();
     this.videoStore = new Map();
     this.imageStore = new Map();
+    this.networkVideoUrls = new Map(); // Store video URLs captured from network requests
     this.settings = {
       quality: 'full',
       autoCreateFolder: true
@@ -17,6 +18,8 @@ class OnlyFansDownloader {
     this.isInitialized = false;
     this.photoSwipeButtonInteracting = false;
     this.photoSwipeUpdateTimeout = null;
+    this.refreshButtonsTimeout = null;
+    this.matchVideoUrlTimeout = null;
   }
 
   /**
@@ -47,6 +50,9 @@ class OnlyFansDownloader {
       this.setupDirectImageClickHandling();
       this.setupThumbnailNavigationHandling();
       this.setupMediaTypeChangeDetection();
+      
+      // Setup network interception to capture video URLs from CDN requests
+      this.setupNetworkInterception();
       
       this.isInitialized = true;
       console.log('OnlyFans Downloader initialized successfully');
@@ -405,17 +411,99 @@ class OnlyFansDownloader {
     const posts = document.querySelectorAll('.b-post');
     
     posts.forEach(post => {
-      if (post.querySelector(`.${this.uniqueClass}`)) return;
+      // Check for videos first (they take priority)
+      const videoWrappers = post.querySelectorAll('.video-wrapper');
+      const videoJsPlayers = post.querySelectorAll('.video-js, [class*="videoPlayer-"]');
+      const videos = post.querySelectorAll('video');
       
-      const mediaToDownload = this.extractMediaFromPost(post);
+      let hasVideo = false;
+      let videoUrl = null;
       
-      if (mediaToDownload.length > 0) {
-        const buttonContainer = this.createDownloadButtonContainer(mediaToDownload);
-        const toolsContainer = post.querySelector('.b-post__tools');
-        
-        if (toolsContainer) {
-          toolsContainer.appendChild(buttonContainer);
+      // Try to extract video URL from wrappers
+      if (videoWrappers.length > 0) {
+        for (const wrapper of videoWrappers) {
+          videoUrl = this.extractVideoUrl(wrapper, post);
+          if (videoUrl) {
+            hasVideo = true;
+            break;
+          }
         }
+      }
+      
+      // If no URL from wrappers, try video.js players
+      if (!videoUrl && videoJsPlayers.length > 0) {
+        for (const player of videoJsPlayers) {
+          videoUrl = this.extractVideoUrlFromVideoJsPlayer(player);
+          if (videoUrl) {
+            hasVideo = true;
+            break;
+          }
+        }
+      }
+      
+      // If still no URL, try direct video elements
+      if (!videoUrl && videos.length > 0) {
+        for (const video of videos) {
+          videoUrl = this.extractVideoUrlFromElement(video);
+          if (videoUrl) {
+            hasVideo = true;
+            break;
+          }
+        }
+      }
+      
+      // If still no URL, check network-captured URLs
+      if (!videoUrl && (videoWrappers.length > 0 || videoJsPlayers.length > 0 || videos.length > 0)) {
+        const postId = post.getAttribute('data-id') || post.id;
+        if (postId) {
+          for (const [cleanUrl, data] of this.networkVideoUrls.entries()) {
+            if (data.url.includes(postId)) {
+              videoUrl = data.url;
+              hasVideo = true;
+              console.log('✅ Using network-captured video URL for post:', postId);
+              break;
+            }
+          }
+        }
+      }
+      
+      // If we have a video, create video button (even if image buttons exist)
+      if (hasVideo && videoUrl) {
+        const existingVideoButton = post.querySelector(`.${this.uniqueClass} button`);
+        let hasVideoButton = false;
+        
+        // Check if existing button is for video
+        if (existingVideoButton) {
+          const buttonText = existingVideoButton.textContent || '';
+          if (buttonText.includes('Video') || buttonText.includes('video') || buttonText.includes('🎬')) {
+            hasVideoButton = true;
+          }
+        }
+        
+        if (!hasVideoButton) {
+          const container = videoWrappers[0] || videoJsPlayers[0] || videos[0]?.closest('.video-wrapper, .video-js') || post;
+          this.createVideoDownloadButton(container, videoUrl);
+        }
+      }
+      
+      // Handle images (only if no button exists yet)
+      const existingButton = post.querySelector(`.${this.uniqueClass}`);
+      if (!existingButton) {
+        const mediaToDownload = this.extractMediaFromPost(post);
+        
+        if (mediaToDownload.length > 0) {
+          const buttonContainer = this.createDownloadButtonContainer(mediaToDownload);
+          const toolsContainer = post.querySelector('.b-post__tools');
+          
+          if (toolsContainer) {
+            toolsContainer.appendChild(buttonContainer);
+          }
+        }
+      }
+      
+      // Set up Swiper listeners for posts with carousels
+      if (post.querySelector('.swiper')) {
+        this.setupSwiperListenersForPost(post);
       }
     });
   }
@@ -608,39 +696,22 @@ class OnlyFansDownloader {
     const mediaToDownload = [];
     const creatorUsername = this.getCreatorUsername(post);
     
-    // First, check for videos (prioritize videos over images)
-    const videoWrappers = post.querySelectorAll('div.video-wrapper');
-    let hasVideo = false;
-    
-    videoWrappers.forEach(wrapper => {
-      const videoUrl = this.extractVideoUrl(wrapper, post);
-      if (videoUrl) {
-        mediaToDownload.push([videoUrl, creatorUsername, 'download video']);
-        hasVideo = true;
-      }
-    });
-    
-    // Only add images if no videos were found, or if there are additional images
-    if (!hasVideo) {
+    // Extract all images (old working approach)
       const images = post.querySelectorAll('img.b-post__media__img');
       images.forEach(img => {
         if (img.src) {
           mediaToDownload.push([img.src, creatorUsername, 'download']);
         }
       });
-    } else {
-      // If we have videos, only add images that are not thumbnails/previews of the videos
-      const images = post.querySelectorAll('img.b-post__media__img');
-      images.forEach(img => {
-        if (img.src) {
-          // Check if this image is likely a video thumbnail/preview
-          const isVideoThumbnail = this.isVideoThumbnail(img, videoWrappers);
-          if (!isVideoThumbnail) {
-            mediaToDownload.push([img.src, creatorUsername, 'download']);
-          }
-        }
-      });
-    }
+    
+    // Also check for videos (keep video download fix)
+    const videoWrappers = post.querySelectorAll('div.video-wrapper');
+    videoWrappers.forEach(wrapper => {
+      const videoUrl = this.extractVideoUrl(wrapper, post);
+      if (videoUrl) {
+        mediaToDownload.push([videoUrl, creatorUsername, 'download video']);
+      }
+    });
     
     return mediaToDownload;
   }
@@ -675,37 +746,202 @@ class OnlyFansDownloader {
    * Extract video URL from video wrapper with multiple fallback methods
    */
   extractVideoUrl(wrapper, post) {
-    console.log('🔍 Extracting video URL from wrapper:', wrapper);
+    // Method 1: Try to get from video.js player instance (this is where the actual URLs are stored)
+    const videoJsPlayer = wrapper.querySelector('.video-js');
+    if (videoJsPlayer && videoJsPlayer.id) {
+      try {
+        // Access video.js player instance - try multiple methods
+        let player = null;
+        if (typeof videojs !== 'undefined') {
+          try {
+            player = videojs(videoJsPlayer.id);
+          } catch (e) {
+            // Try alternative access methods
+            try {
+              player = videojs.getPlayer ? videojs.getPlayer(videoJsPlayer.id) : null;
+            } catch (e2) {
+              player = videoJsPlayer.player || videoJsPlayer.videojs || videoJsPlayer.__player;
+            }
+          }
+        }
+        
+        if (player) {
+          console.log('✅ Found video.js player instance:', player);
+          
+          // Method 1a: Try httpSourceSelector plugin (OnlyFans uses this)
+          if (player.httpSourceSelector) {
+            try {
+              const sources = player.httpSourceSelector.sources;
+              if (sources && sources.length > 0) {
+                console.log('📹 Found sources from httpSourceSelector:', sources);
+                // Prefer original quality
+                for (const src of sources) {
+                  if (src.src && !src.src.startsWith('blob:')) {
+                    if (src.label === 'original' || src.label === 'Original' || src.label === 'auto') {
+                      console.log('✅ Using source from httpSourceSelector:', src.src);
+                      return src.src;
+                    }
+                  }
+                }
+                // Fallback to first non-blob source
+                for (const src of sources) {
+                  if (src.src && !src.src.startsWith('blob:')) {
+                    console.log('✅ Using first source from httpSourceSelector:', src.src);
+                    return src.src;
+                  }
+                }
+              }
+            } catch (e) {
+              console.log('⚠️ Error accessing httpSourceSelector:', e);
+            }
+          }
+          
+          // Method 1b: Try currentSources method
+          if (player.currentSources) {
+            try {
+              const sources = player.currentSources();
+              if (sources && sources.length > 0) {
+                console.log('📹 Found sources from currentSources():', sources);
+                // Prefer original quality
+                for (const src of sources) {
+                  if (src.src && !src.src.startsWith('blob:')) {
+                    if (src.label === 'original' || src.label === 'Original') {
+                      console.log('✅ Using source from currentSources:', src.src);
+                      return src.src;
+                    }
+                  }
+                }
+                // Fallback to first non-blob source
+                for (const src of sources) {
+                  if (src.src && !src.src.startsWith('blob:')) {
+                    console.log('✅ Using first source from currentSources:', src.src);
+                    return src.src;
+                  }
+                }
+              }
+            } catch (e) {
+              console.log('⚠️ Error accessing currentSources:', e);
+            }
+          }
+          
+          // Method 1c: Try src() method (returns current source object)
+          if (player.src) {
+            try {
+              const srcObj = typeof player.src === 'function' ? player.src() : player.src;
+              if (srcObj) {
+                // src() can return an object or string
+                const srcUrl = typeof srcObj === 'string' ? srcObj : (srcObj.src || srcObj.url);
+                if (srcUrl && !srcUrl.startsWith('blob:')) {
+                  console.log('✅ Using source from src():', srcUrl);
+                  return srcUrl;
+                }
+              }
+            } catch (e) {
+              console.log('⚠️ Error accessing src():', e);
+            }
+          }
+          
+          // Method 1d: Try currentSrc method
+          if (player.currentSrc) {
+            try {
+              const currentSrc = player.currentSrc();
+              if (currentSrc && !currentSrc.startsWith('blob:')) {
+                console.log('✅ Using source from currentSrc():', currentSrc);
+                return currentSrc;
+              }
+            } catch (e) {
+              console.log('⚠️ Error accessing currentSrc:', e);
+            }
+          }
+          
+          // Method 1e: Try to access player's internal cache/source list
+          if (player.cache_ && player.cache_.sources) {
+            try {
+              const cachedSources = player.cache_.sources;
+              if (cachedSources && cachedSources.length > 0) {
+                console.log('📹 Found sources from player cache:', cachedSources);
+                for (const src of cachedSources) {
+                  if (src.src && !src.src.startsWith('blob:')) {
+                    if (src.label === 'original' || src.label === 'Original') {
+                      console.log('✅ Using source from cache:', src.src);
+                      return src.src;
+                    }
+                  }
+                }
+                for (const src of cachedSources) {
+                  if (src.src && !src.src.startsWith('blob:')) {
+                    console.log('✅ Using first source from cache:', src.src);
+                    return src.src;
+                  }
+                }
+              }
+            } catch (e) {
+              console.log('⚠️ Error accessing player cache:', e);
+            }
+          }
+          
+          // Method 1f: Try to get from quality selector menu items
+          const sourceSelector = videoJsPlayer.querySelector('.vjs-http-source-selector');
+          if (sourceSelector) {
+            const menuItems = sourceSelector.querySelectorAll('.vjs-menu-item');
+            for (const item of menuItems) {
+              const text = item.textContent.trim().toLowerCase();
+              if (text === 'original') {
+                // Try to get the source URL from the menu item
+                const sourceUrl = item.getAttribute('data-src') || item.dataset.src;
+                if (sourceUrl && !sourceUrl.startsWith('blob:')) {
+                  console.log('✅ Using source from menu item:', sourceUrl);
+                  return sourceUrl;
+                }
+              }
+            }
+          }
+          
+          // Method 1g: Try to access sources from player's tech (video element)
+          if (player.tech_ && player.tech_.src) {
+            try {
+              const techSrc = player.tech_.src();
+              if (techSrc && !techSrc.startsWith('blob:')) {
+                console.log('✅ Using source from tech:', techSrc);
+                return techSrc;
+              }
+            } catch (e) {
+              console.log('⚠️ Error accessing tech src:', e);
+            }
+          }
+        } else {
+          console.log('⚠️ Could not access video.js player instance');
+        }
+      } catch (e) {
+        console.log('⚠️ Error accessing video.js player:', e);
+      }
+    }
     
-    // Method 1: Try to get from video source element
+    // Method 2: Try to get from video source element (fallback)
     const video = wrapper.querySelector('video.vjs-tech');
     if (video) {
-      console.log('📹 Found video element:', video);
-      
       const source = video.querySelector('source[label="original"]');
-      if (source && source.src) {
-        console.log('✅ Found original source:', source.src);
+      if (source && source.src && !source.src.startsWith('blob:')) {
         return source.src;
       }
       
-      // Try any source element
-      const anySource = video.querySelector('source');
-      if (anySource && anySource.src) {
-        console.log('✅ Found any source:', anySource.src);
-        return anySource.src;
+      // Try any source element (skip blob URLs)
+      const allSources = video.querySelectorAll('source');
+      for (const source of allSources) {
+        if (source.src && !source.src.startsWith('blob:')) {
+          return source.src;
+        }
       }
       
-      // Try video src directly
-      if (video.src) {
-        console.log('✅ Found video src:', video.src);
+      // Skip blob URLs for video src
+      if (video.src && !video.src.startsWith('blob:')) {
         return video.src;
       }
     }
 
-    // Method 2: Try to get from API data (mediaStore)
+    // Method 3: Try to get from API data (mediaStore)
     const postId = post?.getAttribute('data-id');
     if (postId && this.mediaStore.has(postId)) {
-      console.log('📊 Found post in mediaStore:', postId);
       const postData = this.mediaStore.get(postId);
       const mediaList = postData.media || [];
       
@@ -719,71 +955,22 @@ class OnlyFansDownloader {
           
           const videoUrl = qualityMap[this.settings.quality] || qualityMap.full;
           if (videoUrl) {
-            console.log('✅ Found video URL from API data:', videoUrl);
             return videoUrl;
           }
         }
       }
     }
 
-    // Method 3: Try to extract from data attributes
-    const videoElement = wrapper.querySelector('video');
-    if (videoElement) {
-      console.log('🔍 Checking data attributes on video element');
-      
-      // Check for data attributes that might contain video URLs
-      const dataSrc = videoElement.getAttribute('data-src');
-      if (dataSrc) {
-        console.log('✅ Found data-src:', dataSrc);
-        return dataSrc;
-      }
-      
-      const dataVideo = videoElement.getAttribute('data-video');
-      if (dataVideo) {
-        console.log('✅ Found data-video:', dataVideo);
-        return dataVideo;
-      }
-    }
-
-    // Method 4: Try to get from parent wrapper data attributes
-    const wrapperDataSrc = wrapper.getAttribute('data-src');
-    if (wrapperDataSrc) {
-      console.log('✅ Found wrapper data-src:', wrapperDataSrc);
-      return wrapperDataSrc;
-    }
-
-    // Method 5: Try to find video URL in the DOM structure
-    const allVideos = wrapper.querySelectorAll('video');
-    for (const video of allVideos) {
-      console.log('🔍 Checking video element:', video);
-      console.log('Video src:', video.src);
-      console.log('Video sources:', Array.from(video.querySelectorAll('source')).map(s => s.src));
-      
-      if (video.src && video.src !== '') {
-        console.log('✅ Found video src in DOM:', video.src);
-        return video.src;
-      }
-      
-      const sources = video.querySelectorAll('source');
-      for (const source of sources) {
-        if (source.src && source.src !== '') {
-          console.log('✅ Found source src in DOM:', source.src);
-          return source.src;
+    // Method 4: Try to get from network-captured URLs
+    if (postId) {
+      for (const [cleanUrl, data] of this.networkVideoUrls.entries()) {
+        if (data.url.includes(postId)) {
+          console.log('✅ Using network-captured video URL for post:', postId);
+          return data.url;
         }
       }
     }
 
-    // Method 6: Try to extract from any video-related elements
-    const videoElements = wrapper.querySelectorAll('[data-video], [data-src], [data-url]');
-    for (const element of videoElements) {
-      const videoUrl = element.getAttribute('data-video') || element.getAttribute('data-src') || element.getAttribute('data-url');
-      if (videoUrl && videoUrl.includes('http')) {
-        console.log('✅ Found video URL in data attribute:', videoUrl);
-        return videoUrl;
-      }
-    }
-
-    console.log('❌ No video URL found');
     return null;
   }
 
@@ -821,29 +1008,133 @@ class OnlyFansDownloader {
    * Extract video URL from video element
    */
   extractVideoUrlFromElement(video) {
-    // Method 1: Try source element with original label
+    // Method 1: Try to get from video.js player instance (actual URLs are stored here)
+    const videoJsPlayer = video.closest('.video-js');
+    if (videoJsPlayer && videoJsPlayer.id) {
+      try {
+        let player = null;
+        if (typeof videojs !== 'undefined') {
+          try {
+            player = videojs(videoJsPlayer.id);
+          } catch (e) {
+            try {
+              player = videojs.getPlayer ? videojs.getPlayer(videoJsPlayer.id) : null;
+            } catch (e2) {
+              player = videoJsPlayer.player || videoJsPlayer.videojs || videoJsPlayer.__player;
+            }
+          }
+        }
+        
+        if (player) {
+          console.log('✅ Found video.js player instance in extractVideoUrlFromElement');
+          
+          // Method 1a: Try httpSourceSelector plugin (OnlyFans uses this)
+          if (player.httpSourceSelector) {
+            try {
+              const sources = player.httpSourceSelector.sources;
+              if (sources && sources.length > 0) {
+                // Prefer original quality
+                for (const src of sources) {
+                  if (src.src && !src.src.startsWith('blob:')) {
+                    if (src.label === 'original' || src.label === 'Original' || src.label === 'auto') {
+                      return src.src;
+                    }
+                  }
+                }
+                // Fallback to first non-blob source
+                for (const src of sources) {
+                  if (src.src && !src.src.startsWith('blob:')) {
+                    return src.src;
+                  }
+                }
+              }
+            } catch (e) {
+              console.log('⚠️ Error accessing httpSourceSelector:', e);
+            }
+          }
+          
+          // Method 1b: Try currentSources method
+          if (player.currentSources) {
+            try {
+              const sources = player.currentSources();
+              if (sources && sources.length > 0) {
+                // Prefer original quality
+                for (const src of sources) {
+                  if (src.src && !src.src.startsWith('blob:')) {
+                    if (src.label === 'original' || src.label === 'Original') {
+                      return src.src;
+                    }
+                  }
+                }
+                // Fallback to first non-blob source
+                for (const src of sources) {
+                  if (src.src && !src.src.startsWith('blob:')) {
+                    return src.src;
+                  }
+                }
+              }
+            } catch (e) {
+              console.log('⚠️ Error accessing currentSources:', e);
+            }
+          }
+          
+          // Method 1c: Try src() method
+          if (player.src) {
+            try {
+              const srcObj = typeof player.src === 'function' ? player.src() : player.src;
+              if (srcObj) {
+                const srcUrl = typeof srcObj === 'string' ? srcObj : (srcObj.src || srcObj.url);
+                if (srcUrl && !srcUrl.startsWith('blob:')) {
+                  return srcUrl;
+                }
+              }
+            } catch (e) {
+              console.log('⚠️ Error accessing src():', e);
+            }
+          }
+          
+          // Method 1d: Try currentSrc method
+          if (player.currentSrc) {
+            try {
+              const currentSrc = player.currentSrc();
+              if (currentSrc && !currentSrc.startsWith('blob:')) {
+                return currentSrc;
+              }
+            } catch (e) {
+              console.log('⚠️ Error accessing currentSrc:', e);
+            }
+          }
+        }
+      } catch (e) {
+        console.log('⚠️ Error accessing video.js player:', e);
+      }
+    }
+    
+    // Method 2: Try source element with original label (skip blob URLs)
     const source = video.querySelector('source[label="original"]');
-    if (source && source.src) {
+    if (source && source.src && !source.src.startsWith('blob:')) {
       return source.src;
     }
     
-    // Method 2: Try any source element
-    const anySource = video.querySelector('source');
-    if (anySource && anySource.src) {
-      return anySource.src;
+    // Method 3: Try any source element (skip blob URLs)
+    const allSources = video.querySelectorAll('source');
+    for (const source of allSources) {
+      if (source.src && !source.src.startsWith('blob:')) {
+        return source.src;
+      }
     }
     
-    // Method 3: Try video src directly
-    if (video.src) {
+    // Method 4: Try video src directly (skip blob URLs)
+    if (video.src && !video.src.startsWith('blob:')) {
       return video.src;
     }
     
-    // Method 4: Check data attributes
+    // Method 5: Check data attributes (skip blob URLs)
     const dataSrc = video.getAttribute('data-src');
-    if (dataSrc) return dataSrc;
+    if (dataSrc && !dataSrc.startsWith('blob:')) return dataSrc;
     
     const dataVideo = video.getAttribute('data-video');
-    if (dataVideo) return dataVideo;
+    if (dataVideo && !dataVideo.startsWith('blob:')) return dataVideo;
     
     return null;
   }
@@ -967,20 +1258,46 @@ class OnlyFansDownloader {
         e.cancelBubble = true;
       }
       
+      // Prevent any default browser behavior
+      if (e.defaultPrevented === false) {
+        e.preventDefault();
+      }
+      
       try {
         button.textContent = '⏳ Downloading...';
         button.disabled = true;
         
+        let successCount = 0;
+        let failCount = 0;
+        
         // Download all media in the group
         for (const [url, creator, type] of mediaGroup) {
           try {
+            // Validate URL before attempting download
+            if (!url || typeof url !== 'string' || url.trim() === '') {
+              console.error('❌ Invalid URL in media group:', url);
+              failCount++;
+              continue;
+            }
+            
             await this.downloadMedia(url, creator, type);
+            successCount++;
           } catch (error) {
-            console.error(`Failed to download ${url}:`, error);
+            console.error(`❌ Failed to download ${url}:`, error);
+            failCount++;
+            // Don't throw - continue with other downloads
           }
         }
         
+        // Update button text based on results
+        if (failCount === 0) {
         button.textContent = '✅ Downloaded';
+        } else if (successCount > 0) {
+          button.textContent = `⚠️ ${successCount} downloaded, ${failCount} failed`;
+        } else {
+          button.textContent = '❌ All downloads failed';
+        }
+        
         setTimeout(() => {
           if (isMixed) {
             button.textContent = `📥 Download All (${mediaGroup.length})`;
@@ -992,7 +1309,7 @@ class OnlyFansDownloader {
           button.disabled = false;
         }, 2000);
       } catch (error) {
-        console.error('Download failed:', error);
+        console.error('❌ Download failed:', error);
         button.textContent = '❌ Failed';
         setTimeout(() => {
           if (isMixed) {
@@ -1005,6 +1322,9 @@ class OnlyFansDownloader {
           button.disabled = false;
         }, 2000);
       }
+      
+      // Return false to prevent any navigation
+      return false;
     });
     
     return button;
@@ -1014,14 +1334,88 @@ class OnlyFansDownloader {
    * Download media file
    */
   async downloadMedia(url, creator, type) {
+    // Validate URL before attempting download
+    if (!url || typeof url !== 'string') {
+      console.error('❌ Invalid URL provided:', url);
+      throw new Error('Invalid URL provided');
+    }
+    
+    // Trim whitespace
+    url = url.trim();
+    
+    // Prevent empty URLs
+    if (url === '') {
+      console.error('❌ Empty URL provided');
+      throw new Error('Empty URL provided');
+    }
+    
+    // Prevent URLs that might cause page navigation
+    if (url.includes('javascript:') || url.startsWith('data:')) {
+      console.error('❌ Unsafe URL detected:', url);
+      throw new Error('Unsafe URL detected');
+    }
+    
+    // Try to convert relative URLs to absolute URLs
+    let finalUrl = url;
+    try {
+      // If URL is relative, try to make it absolute
+      if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        // Try to resolve relative URL
+        finalUrl = new URL(url, window.location.origin).href;
+        console.log('🔄 Converted relative URL to absolute:', finalUrl);
+      } else {
+        // Validate absolute URL
+        const urlObj = new URL(url);
+        if (!['http:', 'https:'].includes(urlObj.protocol)) {
+          console.error('❌ Invalid URL protocol:', urlObj.protocol, 'Full URL:', url);
+          throw new Error('Invalid URL protocol');
+        }
+        finalUrl = url;
+      }
+    } catch (e) {
+      // If URL validation fails, log the actual URL for debugging
+      console.error('❌ URL validation failed:', {
+        originalUrl: url,
+        error: e.message,
+        urlLength: url.length,
+        urlPreview: url.substring(0, 200)
+      });
+      // Still try to download - the browser might handle it
+      finalUrl = url;
+    }
+    
+    // Log the download attempt
+    console.log('📥 Attempting to download:', {
+      url: finalUrl.substring(0, 150) + (finalUrl.length > 150 ? '...' : ''),
+      creator,
+      type,
+      urlLength: finalUrl.length
+    });
+    
     return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage([url, creator, type], (response) => {
+      try {
+        chrome.runtime.sendMessage([finalUrl, creator, type], (response) => {
         if (chrome.runtime.lastError) {
+            console.error('❌ Download error:', {
+              error: chrome.runtime.lastError.message,
+              url: finalUrl.substring(0, 150),
+              creator,
+              type
+            });
           reject(new Error(chrome.runtime.lastError.message));
         } else {
+            console.log('✅ Download request sent successfully');
           resolve(response);
         }
       });
+      } catch (error) {
+        console.error('❌ Error sending download message:', {
+          error: error.message,
+          url: finalUrl.substring(0, 150),
+          stack: error.stack
+        });
+        reject(error);
+      }
     });
   }
 
@@ -1036,48 +1430,10 @@ class OnlyFansDownloader {
         return;
       }
       
-      const topBar = viewer.querySelector('.pswp__top-bar');
-      if (!topBar) {
+      // Use the new update method which handles bottom bar
+      this.updatePhotoSwipeButtons();
+      
         setTimeout(checkPhotoSwipe, 1000);
-        return;
-      }
-      
-      // Remove existing download buttons
-      const existingButtons = topBar.querySelectorAll(`.${this.uniqueClass}`);
-      existingButtons.forEach(btn => btn.remove());
-      
-      // Get current slide media
-      const activeSlide = viewer.querySelector('.pswp__item[aria-hidden="false"]');
-      if (!activeSlide) {
-        setTimeout(checkPhotoSwipe, 1000);
-        return;
-      }
-      
-      let mediaUrl = null;
-      let buttonLabel = 'download';
-      
-      // Check for video
-      const videoSource = activeSlide.querySelector('source[label="original"]');
-      if (videoSource) {
-        mediaUrl = videoSource.getAttribute('src');
-        buttonLabel = 'download video';
-      } else {
-        // Check for image
-        const image = activeSlide.querySelector('img');
-        if (image) {
-          mediaUrl = image.getAttribute('src');
-        }
-      }
-      
-      if (mediaUrl) {
-        const username = window.location.pathname.split('/')[1] || 'unknown_creator';
-        const downloadData = [[mediaUrl, username, buttonLabel]];
-        const buttonContainer = this.createDownloadButtonContainer(downloadData);
-        buttonContainer.classList.add(this.uniqueClass);
-        topBar.insertBefore(buttonContainer, topBar.firstChild);
-      }
-      
-      setTimeout(checkPhotoSwipe, 1000);
     };
     
     setTimeout(checkPhotoSwipe, 1000);
@@ -1135,10 +1491,17 @@ class OnlyFansDownloader {
       // Set up observer for slide changes
       this.observePhotoSwipeSlideChanges(viewer);
       
-      // Check for PhotoSwipe close
+      // Check for PhotoSwipe close and reset observer
       const checkClose = () => {
         if (!document.querySelector('.pswp--open')) {
-          console.log('🖼️ PhotoSwipe closed');
+          console.log('🖼️ PhotoSwipe closed, resetting observer');
+          // Reset observer so it can be set up again next time
+          if (this.photoSwipeSlideObserver) {
+            this.photoSwipeSlideObserver.disconnect();
+            this.photoSwipeSlideObserver = null;
+          }
+          // Reset interaction flag
+          this.photoSwipeButtonInteracting = false;
           return;
         }
         setTimeout(checkClose, 1000);
@@ -1247,20 +1610,50 @@ class OnlyFansDownloader {
       return;
     }
     
+    // Clean up any old buttons from top bar (if they exist from previous version)
     const topBar = viewer.querySelector('.pswp__top-bar');
-    if (!topBar) {
-      return;
+    if (topBar) {
+      const oldButtons = topBar.querySelectorAll(`.${this.uniqueClass}`);
+      oldButtons.forEach(btn => btn.remove());
+    }
+    
+    // Get or create bottom bar container for buttons
+    let bottomBar = viewer.querySelector('.pswp__bottom-bar');
+    if (!bottomBar) {
+      // Create bottom bar if it doesn't exist
+      bottomBar = document.createElement('div');
+      bottomBar.className = 'pswp__bottom-bar';
+      bottomBar.style.cssText = `
+        position: absolute;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        padding: 15px 20px;
+        background: linear-gradient(to top, rgba(0,0,0,0.7) 0%, rgba(0,0,0,0) 100%);
+        z-index: 2000;
+        pointer-events: none;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+      `;
+      
+      const uiContainer = viewer.querySelector('.pswp__ui');
+      if (uiContainer) {
+        uiContainer.appendChild(bottomBar);
+      } else {
+        viewer.appendChild(bottomBar);
+      }
     }
     
     // Get current slide
-    const activeSlide = viewer.querySelector('.pswp__item[aria-hidden="false"]');
-    if (!activeSlide) {
-      return;
-    }
-    
+      const activeSlide = viewer.querySelector('.pswp__item[aria-hidden="false"]');
+      if (!activeSlide) {
+        return;
+      }
+      
     // Extract media URL from current slide
-    let mediaUrl = null;
-    let buttonLabel = 'download';
+      let mediaUrl = null;
+      let buttonLabel = 'download';
     let creatorUsername = 'unknown_creator';
     
     // Try to get creator username from the original post
@@ -1270,25 +1663,25 @@ class OnlyFansDownloader {
     }
     
     // Check for video in current slide
-    const videoSource = activeSlide.querySelector('source[label="original"]');
-    if (videoSource) {
-      mediaUrl = videoSource.getAttribute('src');
-      buttonLabel = 'download video';
-    } else {
+      const videoSource = activeSlide.querySelector('source[label="original"]');
+      if (videoSource) {
+        mediaUrl = videoSource.getAttribute('src');
+        buttonLabel = 'download video';
+      } else {
       // Check for image in current slide
-      const image = activeSlide.querySelector('img');
-      if (image) {
-        mediaUrl = image.getAttribute('src');
+        const image = activeSlide.querySelector('img');
+        if (image) {
+          mediaUrl = image.getAttribute('src');
+        }
       }
-    }
-    
+      
     if (!mediaUrl) {
       console.log('⚠️ No media URL found in current PhotoSwipe slide');
       return;
     }
     
     // Check if button already exists with the same URL
-    const existingButtons = topBar.querySelectorAll(`.${this.uniqueClass}`);
+    const existingButtons = bottomBar.querySelectorAll(`.${this.uniqueClass}`);
     let needsUpdate = true;
     
     if (existingButtons.length > 0) {
@@ -1313,8 +1706,8 @@ class OnlyFansDownloader {
     
     console.log('✅ Found media URL in PhotoSwipe slide:', mediaUrl);
     const downloadData = [[mediaUrl, creatorUsername, buttonLabel]];
-    const buttonContainer = this.createDownloadButtonContainer(downloadData);
-    buttonContainer.classList.add(this.uniqueClass);
+        const buttonContainer = this.createDownloadButtonContainer(downloadData);
+        buttonContainer.classList.add(this.uniqueClass);
     
     // Store media URL in button for comparison
     const buttons = buttonContainer.querySelectorAll('button');
@@ -1325,17 +1718,16 @@ class OnlyFansDownloader {
     // Add PhotoSwipe-specific styling for better visibility and clickability
     // Use setProperty to ensure styles are applied correctly
     buttonContainer.style.setProperty('position', 'relative', 'important');
-    buttonContainer.style.setProperty('z-index', '2000', 'important');
+    buttonContainer.style.setProperty('z-index', '2001', 'important');
     buttonContainer.style.setProperty('pointer-events', 'auto', 'important');
-    buttonContainer.style.setProperty('margin-left', '10px', 'important');
-    buttonContainer.style.setProperty('margin-right', '10px', 'important');
     buttonContainer.style.setProperty('display', 'flex', 'important');
     buttonContainer.style.setProperty('gap', '5px', 'important');
+    buttonContainer.style.setProperty('justify-content', 'center', 'important');
     
     // Ensure all buttons inside are clickable and add interaction handlers
     buttons.forEach(btn => {
       btn.style.setProperty('position', 'relative', 'important');
-      btn.style.setProperty('z-index', '2001', 'important');
+      btn.style.setProperty('z-index', '2002', 'important');
       btn.style.setProperty('pointer-events', 'auto', 'important');
       btn.style.setProperty('cursor', 'pointer', 'important');
       
@@ -1362,7 +1754,8 @@ class OnlyFansDownloader {
       });
     });
     
-    topBar.insertBefore(buttonContainer, topBar.firstChild);
+    // Append to bottom bar (center aligned)
+    bottomBar.appendChild(buttonContainer);
   }
 
   /**
@@ -1470,7 +1863,10 @@ class OnlyFansDownloader {
     const existingButtons = post.querySelectorAll(`.${this.uniqueClass}`);
     existingButtons.forEach(btn => btn.remove());
     
-    // Extract media URL for current item
+    const creatorUsername = this.getCreatorUsername(post);
+    const downloadData = [];
+    
+    // Extract current item's media URL
     let mediaUrl = null;
     let buttonLabel = 'download';
     
@@ -1482,16 +1878,32 @@ class OnlyFansDownloader {
         buttonLabel = 'download video';
       }
     } else {
-      // Handle image
+      // Handle image - get the actual visible image
       const img = currentItem.querySelector('img');
       if (img) {
-        mediaUrl = img.src;
+        // Try to get the full-size image URL (not thumbnail)
+        mediaUrl = img.src || img.getAttribute('data-src') || img.getAttribute('data-lazy-src');
       }
     }
     
+    // Always add current item
     if (mediaUrl) {
-      const creatorUsername = this.getCreatorUsername(post);
-      const downloadData = [[mediaUrl, creatorUsername, buttonLabel]];
+      downloadData.push([mediaUrl, creatorUsername, buttonLabel]);
+    }
+    
+    // If multiple items, also add "Download All" option
+    if (totalItems > 1) {
+      // Get all media for "Download All" button
+      const allMedia = this.extractMediaFromPost(post);
+      if (allMedia.length > 1) {
+        // Create a combined array for "Download All" - group all media together
+        const allMediaGroup = allMedia.map(([url, creator, type]) => [url, creator, type]);
+        // Add as a separate group so it creates a "Download All" button
+        downloadData.push(...allMediaGroup);
+      }
+    }
+    
+    if (downloadData.length > 0) {
       const buttonContainer = this.createDownloadButtonContainer(downloadData);
       
       // Add button to the post's tools container (same location as image buttons)
@@ -1659,21 +2071,69 @@ class OnlyFansDownloader {
    * Handle video load event
    */
   handleVideoLoad(video) {
-    const videoUrl = this.extractVideoUrlFromElement(video);
-    if (!videoUrl) return;
-    
-    // Find the appropriate parent container (video wrapper, player, etc.)
-    const parent = video.closest('.video-wrapper, .video-js, [class*="videoPlayer-"]') || video.parentElement;
-    if (parent) {
-      // Check if button already exists in the post
-      const post = parent.closest('.b-post');
-      if (post && !post.querySelector(`.${this.uniqueClass}`)) {
-        this.createVideoDownloadButton(parent, videoUrl);
-      } else if (!post) {
-        // If no post found, still try to add button
-        this.createVideoDownloadButton(parent, videoUrl);
+    // Wait a bit for video to fully load and get actual source
+    setTimeout(() => {
+      let videoUrl = this.extractVideoUrlFromElement(video);
+      
+      // If still no URL, try to get from the video element's currentSrc after it loads
+      if (!videoUrl || videoUrl.startsWith('blob:')) {
+        // Wait for video metadata to load
+        if (video.readyState >= 1) {
+          // Try to get from network - check if video has loaded a real source
+          const currentSrc = video.currentSrc || video.src;
+          if (currentSrc && !currentSrc.startsWith('blob:')) {
+            videoUrl = currentSrc;
+            console.log('✅ Got video URL from currentSrc after load:', videoUrl);
+          }
+        }
       }
-    }
+      
+      if (!videoUrl || videoUrl.startsWith('blob:')) {
+        // Still no URL, try accessing player instance again
+        const videoJsPlayer = video.closest('.video-js');
+        if (videoJsPlayer && videoJsPlayer.id) {
+          try {
+            if (typeof videojs !== 'undefined') {
+              const player = videojs(videoJsPlayer.id);
+              if (player) {
+                // Try all methods again now that video is loaded
+                if (player.httpSourceSelector && player.httpSourceSelector.sources) {
+                  const sources = player.httpSourceSelector.sources;
+                  if (sources && sources.length > 0) {
+                    for (const src of sources) {
+                      if (src.src && !src.src.startsWith('blob:')) {
+                        videoUrl = src.src;
+                        console.log('✅ Got video URL from player after load:', videoUrl);
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            console.log('⚠️ Error accessing player on video load:', e);
+          }
+        }
+      }
+      
+      if (!videoUrl || videoUrl.startsWith('blob:')) {
+        return; // Still no valid URL
+      }
+      
+      // Find the appropriate parent container (video wrapper, player, etc.)
+      const parent = video.closest('.video-wrapper, .video-js, [class*="videoPlayer-"]') || video.parentElement;
+      if (parent) {
+        // Check if button already exists in the post
+        const post = parent.closest('.b-post');
+        if (post && !post.querySelector(`.${this.uniqueClass}`)) {
+          this.createVideoDownloadButton(parent, videoUrl);
+        } else if (!post) {
+          // If no post found, still try to add button
+          this.createVideoDownloadButton(parent, videoUrl);
+        }
+      }
+    }, 500); // Wait 500ms for video to load
   }
 
   /**
@@ -1683,13 +2143,18 @@ class OnlyFansDownloader {
     // Same as handleVideoLoad but triggered on play
     this.handleVideoLoad(video);
     
-    // Also refresh buttons for the post when video starts playing
+    // Don't refresh buttons on play if button already exists - it causes buttons to disappear
+    // The button should already be there from initial detection
     const post = video.closest('.b-post');
     if (post) {
-      console.log('▶️ Video started playing, refreshing buttons...');
-      setTimeout(() => {
-        this.refreshButtonsOnMediaChange(post);
-      }, 300);
+      const existingButton = post.querySelector(`.${this.uniqueClass}`);
+      if (!existingButton) {
+        // Only refresh if button doesn't exist
+        console.log('▶️ Video started playing, button missing, creating button...');
+        setTimeout(() => {
+          this.refreshButtonsOnMediaChange(post);
+        }, 300);
+      }
     }
   }
 
@@ -2166,7 +2631,200 @@ class OnlyFansDownloader {
   extractVideoUrlFromVideoJsPlayer(player) {
     console.log('🔍 Extracting video URL from video.js player:', player);
     
-    // Method 1: Look for video.js tech element
+    // Method 1: Try to access the actual video.js player instance (this is where real URLs are)
+    // First, find the actual video.js player element (not placeholder)
+    const actualPlayer = player.classList.contains('video-js') && !player.classList.contains('video-js-placeholder-wrapper') 
+      ? player 
+      : player.closest('.video-js') || player.querySelector('.video-js');
+    
+    const playerElement = actualPlayer || player;
+    const playerId = playerElement.id;
+    
+    if (playerId) {
+      try {
+        let playerInstance = null;
+        
+        // Check if videojs is available
+        if (typeof videojs !== 'undefined') {
+          try {
+            playerInstance = videojs(playerId);
+            console.log('✅ Accessed player via videojs(id):', playerId);
+          } catch (e) {
+            try {
+              playerInstance = videojs.getPlayer ? videojs.getPlayer(playerId) : null;
+              if (playerInstance) {
+                console.log('✅ Accessed player via videojs.getPlayer(id):', playerId);
+              }
+            } catch (e2) {
+              playerInstance = playerElement.player || playerElement.videojs || playerElement.__player;
+              if (playerInstance) {
+                console.log('✅ Accessed player via element property');
+              }
+            }
+          }
+        }
+        
+        // Also try accessing from window.videojs if available
+        if (!playerInstance && window.videojs) {
+          try {
+            playerInstance = window.videojs(playerId);
+            if (playerInstance) {
+              console.log('✅ Accessed player via window.videojs(id):', playerId);
+            }
+          } catch (e) {
+            // Ignore
+          }
+        }
+        
+        if (playerInstance) {
+          console.log('✅ Found video.js player instance in extractVideoUrlFromVideoJsPlayer');
+          
+          // Check if player is ready (sources might not be loaded yet)
+          const isReady = playerInstance.readyState && playerInstance.readyState() >= 1;
+          if (!isReady) {
+            console.log('⚠️ Player not ready yet, sources may not be loaded');
+          }
+          
+          // Try httpSourceSelector plugin (OnlyFans uses this)
+          if (playerInstance.httpSourceSelector) {
+            try {
+              // Try different ways to access sources
+              let sources = null;
+              if (playerInstance.httpSourceSelector.sources) {
+                sources = playerInstance.httpSourceSelector.sources;
+              } else if (playerInstance.httpSourceSelector.getSources) {
+                sources = playerInstance.httpSourceSelector.getSources();
+              } else if (playerInstance.httpSourceSelector.options && playerInstance.httpSourceSelector.options.sources) {
+                sources = playerInstance.httpSourceSelector.options.sources;
+              }
+              
+              if (sources && sources.length > 0) {
+                console.log('📹 Found sources from httpSourceSelector:', sources);
+                for (const src of sources) {
+                  if (src.src && !src.src.startsWith('blob:')) {
+                    if (src.label === 'original' || src.label === 'Original' || src.label === 'auto') {
+                      console.log('✅ Found source from httpSourceSelector:', src.src);
+                      return src.src;
+                    }
+                  }
+                }
+                for (const src of sources) {
+                  if (src.src && !src.src.startsWith('blob:')) {
+                    console.log('✅ Found first source from httpSourceSelector:', src.src);
+                    return src.src;
+                  }
+                }
+              }
+            } catch (e) {
+              console.log('⚠️ Error accessing httpSourceSelector:', e);
+            }
+          }
+          
+          // Try currentSources
+          if (playerInstance.currentSources) {
+            try {
+              const sources = playerInstance.currentSources();
+              if (sources && sources.length > 0) {
+                for (const src of sources) {
+                  if (src.src && !src.src.startsWith('blob:')) {
+                    if (src.label === 'original' || src.label === 'Original') {
+                      console.log('✅ Found source from currentSources:', src.src);
+                      return src.src;
+                    }
+                  }
+                }
+                for (const src of sources) {
+                  if (src.src && !src.src.startsWith('blob:')) {
+                    console.log('✅ Found first source from currentSources:', src.src);
+                    return src.src;
+                  }
+                }
+              }
+            } catch (e) {
+              console.log('⚠️ Error with currentSources:', e);
+            }
+          }
+          
+          // Try src() method
+          if (playerInstance.src) {
+            try {
+              const srcObj = typeof playerInstance.src === 'function' ? playerInstance.src() : playerInstance.src;
+              if (srcObj) {
+                const srcUrl = typeof srcObj === 'string' ? srcObj : (srcObj.src || srcObj.url);
+                if (srcUrl && !srcUrl.startsWith('blob:')) {
+                  console.log('✅ Found source from src():', srcUrl);
+                  return srcUrl;
+                }
+              }
+            } catch (e) {
+              console.log('⚠️ Error with src():', e);
+            }
+          }
+          
+          // Try currentSrc
+          if (playerInstance.currentSrc) {
+            try {
+              const currentSrc = playerInstance.currentSrc();
+              if (currentSrc && !currentSrc.startsWith('blob:')) {
+                console.log('✅ Found source from currentSrc():', currentSrc);
+                return currentSrc;
+              }
+            } catch (e) {
+              console.log('⚠️ Error with currentSrc:', e);
+            }
+          }
+        }
+      } catch (e) {
+        console.log('⚠️ Error accessing video.js player instance:', e);
+      }
+    }
+    
+    // Method 2: Try to get URLs from quality selector menu items (they might have the URLs)
+    const sourceSelector = player.querySelector('.vjs-http-source-selector');
+    if (sourceSelector) {
+      const menuItems = sourceSelector.querySelectorAll('.vjs-menu-item');
+      console.log('📹 Found quality selector with', menuItems.length, 'items');
+      
+      for (const item of menuItems) {
+        const text = item.textContent.trim().toLowerCase();
+        if (text === 'original') {
+          // Try multiple ways to get the URL from menu item
+          let sourceUrl = item.getAttribute('data-src') || 
+                         item.dataset.src || 
+                         item.getAttribute('data-url') ||
+                         item.dataset.url;
+          
+          // Also check if the item has a click handler that sets the source
+          if (!sourceUrl && item.onclick) {
+            // Try to extract from onclick handler
+            const onclickStr = item.getAttribute('onclick') || item.onclick.toString();
+            const urlMatch = onclickStr.match(/https?:\/\/[^\s"']+/);
+            if (urlMatch) {
+              sourceUrl = urlMatch[0];
+            }
+          }
+          
+          if (sourceUrl && !sourceUrl.startsWith('blob:')) {
+            console.log('✅ Found source from quality selector menu (original):', sourceUrl);
+            return sourceUrl;
+          }
+        }
+      }
+      
+      // If original not found, try any menu item
+      for (const item of menuItems) {
+        const sourceUrl = item.getAttribute('data-src') || 
+                         item.dataset.src || 
+                         item.getAttribute('data-url') ||
+                         item.dataset.url;
+        if (sourceUrl && !sourceUrl.startsWith('blob:')) {
+          console.log('✅ Found source from quality selector menu:', sourceUrl);
+          return sourceUrl;
+        }
+      }
+    }
+    
+    // Method 3: Fallback - Look for video.js tech element
     const videoJsTech = player.querySelector('.vjs-tech');
     if (videoJsTech) {
       const videoUrl = this.extractVideoUrlFromElement(videoJsTech);
@@ -2176,7 +2834,7 @@ class OnlyFansDownloader {
       }
     }
     
-    // Method 2: Look for any video element
+    // Method 3: Fallback - Look for any video element
     const videos = player.querySelectorAll('video');
     for (const video of videos) {
       const videoUrl = this.extractVideoUrlFromElement(video);
@@ -2186,18 +2844,20 @@ class OnlyFansDownloader {
       }
     }
     
-    // Method 3: Check for source elements with specific labels
+    // Method 4: Fallback - Check for source elements with specific labels
     const originalSource = player.querySelector('source[label="original"]');
-    if (originalSource && originalSource.src) {
+    if (originalSource && originalSource.src && !originalSource.src.startsWith('blob:')) {
       console.log('✅ Found original source in video.js player:', originalSource.src);
       return originalSource.src;
     }
     
-    // Method 4: Check any source element
-    const anySource = player.querySelector('source');
-    if (anySource && anySource.src) {
-      console.log('✅ Found any source in video.js player:', anySource.src);
-      return anySource.src;
+    // Method 5: Fallback - Check any source element
+    const allSources = player.querySelectorAll('source');
+    for (const source of allSources) {
+      if (source.src && !source.src.startsWith('blob:')) {
+        console.log('✅ Found source in video.js player:', source.src);
+        return source.src;
+      }
     }
     
     console.log('❌ No video URL found in video.js player');
@@ -2244,6 +2904,11 @@ class OnlyFansDownloader {
    * Create video download button
    */
   createVideoDownloadButton(container, videoUrl) {
+    if (!videoUrl || videoUrl.startsWith('blob:')) {
+      console.log('⚠️ Invalid video URL, skipping button creation:', videoUrl);
+      return;
+    }
+    
     // Find the parent post element
     const post = container.closest('.b-post');
     if (!post) {
@@ -2255,30 +2920,105 @@ class OnlyFansDownloader {
       return;
     }
     
-    // Check if button already exists in the post
-    if (post.querySelector(`.${this.uniqueClass}`)) {
-      console.log('⚠️ Button already exists in post, skipping');
+    // Check if a video button already exists
+    const existingButtons = post.querySelectorAll(`.${this.uniqueClass} button`);
+    let videoButtonExists = false;
+    const cleanVideoUrl = videoUrl.split('?')[0]; // URL without query params for comparison
+    
+    existingButtons.forEach(btn => {
+      // Check if this button is for a video
+      const buttonText = btn.textContent || '';
+      if (buttonText.includes('Video') || buttonText.includes('video') || buttonText.includes('🎬')) {
+        videoButtonExists = true;
+        // Try to check if it's the same URL (optional, for logging)
+        const buttonContainer = btn.closest(`.${this.uniqueClass}`);
+        if (buttonContainer) {
+          const onclick = btn.getAttribute('onclick') || '';
+          const dataUrl = btn.getAttribute('data-url') || buttonContainer.getAttribute('data-url') || '';
+          
+          // Check if URL matches (compare base URL without query params)
+          if ((onclick && onclick.includes(cleanVideoUrl)) || 
+              (dataUrl && dataUrl.includes(cleanVideoUrl))) {
+            console.log('✅ Found existing video button with matching URL');
+          }
+        }
+      }
+    });
+    
+    if (videoButtonExists) {
+      console.log('⚠️ Video button already exists, skipping');
       return;
     }
     
+    // If no video button exists, proceed to create one (even if image buttons exist)
     const creatorUsername = this.getCreatorUsername(post);
     const downloadData = [[videoUrl, creatorUsername, 'download video']];
     
-    // Remove existing download buttons from the post
-    const existingButtons = post.querySelectorAll(`.${this.uniqueClass}`);
-    existingButtons.forEach(btn => btn.remove());
+    // Remove existing video buttons (but keep image buttons if they exist)
+    // Only remove buttons that are specifically for videos
+    const allButtons = post.querySelectorAll(`.${this.uniqueClass} button`);
+    allButtons.forEach(btn => {
+      const buttonText = btn.textContent || '';
+      if (buttonText.includes('Video') || buttonText.includes('video') || buttonText.includes('🎬')) {
+        // Remove the button and its container if it's the only button
+        const container = btn.closest(`.${this.uniqueClass}`);
+        if (container) {
+          const otherButtons = container.querySelectorAll('button');
+          if (otherButtons.length === 1) {
+            // Only button in container, remove container
+            container.remove();
+          } else {
+            // Multiple buttons, just remove this one
+            btn.remove();
+          }
+        } else {
+          btn.remove();
+        }
+      }
+    });
     
-    // Add button to the post's tools container (same location as image buttons)
+    // Always add button to the post's tools container (same location as image buttons)
     const buttonContainer = this.createDownloadButtonContainer(downloadData);
     const toolsContainer = post.querySelector('.b-post__tools');
     
     if (toolsContainer) {
-      toolsContainer.appendChild(buttonContainer);
-      console.log('✅ Created video download button in tools container for:', videoUrl);
+      // Make sure tools container is visible
+      if (toolsContainer.style.display === 'none') {
+        toolsContainer.style.display = '';
+      }
+      
+      // Check if there's already a button container in tools, if so append to it
+      const existingContainer = toolsContainer.querySelector(`.${this.uniqueClass}`);
+      if (existingContainer) {
+        // Append video button to existing container
+        const videoButton = buttonContainer.querySelector('button');
+        if (videoButton) {
+          existingContainer.appendChild(videoButton);
+          console.log('✅ Added video download button to existing container');
+        }
+      } else {
+        toolsContainer.appendChild(buttonContainer);
+        console.log('✅ Created video download button in tools container for:', videoUrl.substring(0, 100) + '...');
+      }
     } else {
-      // Fallback: append to post if tools container doesn't exist
-      post.appendChild(buttonContainer);
-      console.log('✅ Created video download button in post (no tools container) for:', videoUrl);
+      // Fallback: try to find or create tools container
+      console.log('⚠️ Tools container not found, looking for alternative location...');
+      
+      // Try to find post header or actions area
+      const postHeader = post.querySelector('.b-post__header');
+      const postActions = post.querySelector('.b-post__actions, .b-post__footer');
+      
+      if (postHeader) {
+        postHeader.appendChild(buttonContainer);
+        console.log('✅ Created video download button in post header');
+      } else if (postActions) {
+        postActions.appendChild(buttonContainer);
+        console.log('✅ Created video download button in post actions');
+      } else {
+        // Last resort: append to post
+        post.appendChild(buttonContainer);
+        console.log('✅ Created video download button in post (no tools container)');
+      }
     }
   }
 
@@ -2662,33 +3402,17 @@ class OnlyFansDownloader {
           });
         }
         
-        // Watch for attribute changes that might indicate video activation
-        if (mutation.type === 'attributes') {
-          const target = mutation.target;
-          
-          // Check if video started playing or became visible
-          if (target.tagName === 'VIDEO' && 
-              (mutation.attributeName === 'src' || 
-               mutation.attributeName === 'style' ||
-               mutation.attributeName === 'class')) {
-            const post = target.closest('.b-post');
-            if (post) {
-              console.log('🎬 Video attribute changed, refreshing buttons...');
-              setTimeout(() => {
-                this.refreshButtonsOnMediaChange(post);
-              }, 300);
-            }
-          }
-        }
+        // Don't watch video attribute changes - they cause infinite refresh loops
+        // Only watch for when video elements are added to the DOM
       });
     });
     
-    // Observe all posts for video elements appearing
+    // Observe all posts for video elements appearing (only childList, not attributes)
+    // Watching video attributes causes infinite refresh loops
     mediaChangeObserver.observe(document.body, {
       childList: true,
       subtree: true,
-      attributes: true,
-      attributeFilter: ['src', 'style', 'class']
+      attributes: false  // Don't watch attributes - only watch for new elements
     });
     
     // Store observer reference
@@ -2698,57 +3422,395 @@ class OnlyFansDownloader {
   }
 
   /**
-   * Refresh buttons when media type changes (image to video)
+   * Setup network interception to capture video URLs from CDN requests
+   * This intercepts fetch, XHR, and monitors Performance API
+   * Made more selective to avoid rate limiting
    */
-  refreshButtonsOnMediaChange(post) {
-    console.log('🔄 Refreshing buttons for media type change in post:', post);
+  setupNetworkInterception() {
+    console.log('🌐 Setting up network interception for video URLs...');
     
-    // Remove existing buttons
-    const existingButtons = post.querySelectorAll(`.${this.uniqueClass}`);
-    existingButtons.forEach(btn => btn.remove());
+    // Debounce for captureVideoUrl to prevent rapid calls
+    let captureDebounceTimeout = null;
+    const debouncedCapture = (url) => {
+      if (captureDebounceTimeout) {
+        clearTimeout(captureDebounceTimeout);
+      }
+      captureDebounceTimeout = setTimeout(() => {
+        this.captureVideoUrl(url);
+      }, 500); // 500ms debounce
+    };
     
-    // Check for videos first (they take priority)
-    const videos = post.querySelectorAll('video');
-    const videoWrappers = post.querySelectorAll('.video-wrapper');
-    const videoPlayers = post.querySelectorAll('.video-js, [class*="videoPlayer-"]');
+    // Method 1: Intercept fetch() calls - ONLY for video CDN requests
+    const originalFetch = window.fetch;
+    const downloaderInstance = this; // Store reference to this instance
+    window.fetch = async (...args) => {
+      const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || args[0]);
+      
+      // Only intercept actual video CDN requests (very specific pattern)
+      if (url && downloaderInstance.isVideoCdnUrl(url)) {
+        console.log('📹 Intercepted video URL from fetch:', url);
+        debouncedCapture(url);
+      }
+      
+      try {
+        const response = await originalFetch.apply(window, args);
+        return response;
+      } catch (error) {
+        throw error;
+      }
+    };
     
-    let hasVideos = false;
+    // Method 2: Intercept XMLHttpRequest - ONLY for video CDN requests
+    const originalXHROpen = XMLHttpRequest.prototype.open;
+    const originalXHRSend = XMLHttpRequest.prototype.send;
     
-    // Check if any videos are actually present and visible
-    videos.forEach(video => {
-      const videoUrl = this.extractVideoUrlFromElement(video);
-      if (videoUrl) {
-        hasVideos = true;
-        const parent = video.closest('.video-wrapper, .video-js, [class*="videoPlayer-"]') || video.parentElement;
-        if (parent) {
-          this.createVideoDownloadButton(parent, videoUrl);
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+      this._ofUrl = url;
+      return originalXHROpen.apply(this, [method, url, ...rest]);
+    };
+    
+    XMLHttpRequest.prototype.send = function(...args) {
+      if (this._ofUrl) {
+        const downloader = window.onlyFansDownloaderInstance;
+        if (downloader && downloader.isVideoCdnUrl(this._ofUrl)) {
+          console.log('📹 Intercepted video URL from XHR:', this._ofUrl);
+          debouncedCapture(this._ofUrl);
+        }
+      }
+      return originalXHRSend.apply(this, args);
+    };
+    
+    // Method 3: Monitor Performance API for network resources (less frequent)
+    this.setupPerformanceMonitoring();
+    
+    // Method 4: Monitor video element's network activity (passive only)
+    this.setupVideoNetworkMonitoring();
+    
+    console.log('✅ Network interception setup complete');
+  }
+
+  /**
+   * Check if URL is a video CDN URL (more specific to avoid false positives)
+   */
+  isVideoCdnUrl(url) {
+    if (!url || typeof url !== 'string') return false;
+    
+    // Only match actual OnlyFans CDN video URLs (very specific patterns)
+    const videoCdnPatterns = [
+      /cdn\d*\.onlyfans\.com.*\/\d+\/videos\/.*\.mp4/i,
+      /cdn\d*\.onlyfans\.com.*\/videos\/.*\.mp4/i,
+      /cdn\d*\.onlyfans\.com.*\/\d+\/videos\/.*\.m3u8/i
+    ];
+    
+    return videoCdnPatterns.some(pattern => pattern.test(url));
+  }
+  
+  /**
+   * Check if URL is a video URL (broader check for other contexts)
+   */
+  isVideoUrl(url) {
+    if (!url || typeof url !== 'string') return false;
+    
+    // Check for OnlyFans CDN video URLs (more specific)
+    const videoPatterns = [
+      /cdn\d*\.onlyfans\.com.*\.mp4/i,
+      /cdn\d*\.onlyfans\.com.*\/videos\//i,
+      /cdn\d*\.onlyfans\.com.*\/\d+\/videos\//i,
+      /\.mp4(\?|$)/i,
+      /\.m3u8(\?|$)/i
+    ];
+    
+    return videoPatterns.some(pattern => pattern.test(url));
+  }
+
+  /**
+   * Capture and store video URL, then try to match it to a post
+   * Debounced to prevent rate limiting
+   */
+  captureVideoUrl(url) {
+    if (!url || url.startsWith('blob:')) return;
+    
+    // Clean URL (remove query params for matching)
+    const cleanUrl = url.split('?')[0];
+    
+    // Store the URL (only if not already stored)
+    if (!this.networkVideoUrls.has(cleanUrl)) {
+      this.networkVideoUrls.set(cleanUrl, {
+        url: url,
+        timestamp: Date.now()
+      });
+      console.log('💾 Stored video URL:', cleanUrl);
+      
+      // Debounce matching to prevent rapid calls
+      if (this.matchVideoUrlTimeout) {
+        clearTimeout(this.matchVideoUrlTimeout);
+      }
+      this.matchVideoUrlTimeout = setTimeout(() => {
+        this.matchVideoUrlToPost(url);
+      }, 1000); // Wait 1 second before matching
+    }
+  }
+
+  /**
+   * Try to match captured video URL to a post and update buttons
+   */
+  matchVideoUrlToPost(videoUrl) {
+    // Find all posts with video elements
+    const posts = document.querySelectorAll('.b-post');
+    
+    posts.forEach(post => {
+      // Check if this post has a video
+      const videoWrapper = post.querySelector('.video-wrapper');
+      const videoJsPlayer = post.querySelector('.video-js');
+      const videos = post.querySelectorAll('video');
+      
+      if (videoWrapper || videoJsPlayer || videos.length > 0) {
+        // Check if this post already has a video button
+        const existingButtons = post.querySelectorAll(`.${this.uniqueClass} button`);
+        let hasVideoButton = false;
+        
+        existingButtons.forEach(btn => {
+          const buttonText = btn.textContent || '';
+          if (buttonText.includes('Video') || buttonText.includes('video') || buttonText.includes('🎬')) {
+            hasVideoButton = true;
+          }
+        });
+        
+        // If no video button exists, create one (even if image buttons exist)
+        if (!hasVideoButton) {
+          // Try to extract post ID to match
+          const postId = post.getAttribute('data-id') || post.id;
+          
+          // Check if video URL matches this post (by checking if URL contains post ID)
+          if (postId && videoUrl.includes(postId)) {
+            console.log('✅ Matched video URL to post:', postId);
+            this.createVideoDownloadButton(videoWrapper || videoJsPlayer || videos[0]?.closest('.video-wrapper, .video-js') || post, videoUrl);
+          } else {
+            // If no post ID match, try to match by checking if video is in this post
+            // We'll create a button anyway since we have the URL and the post has a video
+            setTimeout(() => {
+              const existingBtns = post.querySelectorAll(`.${this.uniqueClass} button`);
+              let stillNoVideoButton = true;
+              
+              existingBtns.forEach(btn => {
+                const buttonText = btn.textContent || '';
+                if (buttonText.includes('Video') || buttonText.includes('video') || buttonText.includes('🎬')) {
+                  stillNoVideoButton = false;
+                }
+              });
+              
+              if (stillNoVideoButton) {
+                console.log('✅ Creating button for captured video URL in post');
+                this.createVideoDownloadButton(videoWrapper || videoJsPlayer || videos[0]?.closest('.video-wrapper, .video-js') || post, videoUrl);
+              }
+            }, 1000);
+          }
         }
       }
     });
+  }
+
+  /**
+   * Setup Performance API monitoring for network resources
+   * Less frequent to avoid rate limiting
+   */
+  setupPerformanceMonitoring() {
+    // Track processed entries to avoid duplicates
+    const processedEntries = new Set();
     
-    // Also check video wrappers and players
-    if (videoWrappers.length > 0 || videoPlayers.length > 0) {
-      this.handleVideoPlayers();
-    }
-    
-    // If no videos found, check for images
-    if (!hasVideos) {
-      const mediaToDownload = this.extractMediaFromPost(post);
-      if (mediaToDownload.length > 0) {
-        const buttonContainer = this.createDownloadButtonContainer(mediaToDownload);
-        const toolsContainer = post.querySelector('.b-post__tools');
+    // Monitor network resources using Performance API
+    const checkPerformanceEntries = () => {
+      try {
+        const entries = performance.getEntriesByType('resource');
         
-        if (toolsContainer) {
-          toolsContainer.appendChild(buttonContainer);
-          console.log('✅ Refreshed image buttons in tools container');
-        } else {
-          post.appendChild(buttonContainer);
-          console.log('✅ Refreshed image buttons in post (no tools container)');
+        entries.forEach(entry => {
+          // Only process video CDN URLs and avoid duplicates
+          if (entry.name && this.isVideoCdnUrl(entry.name) && !processedEntries.has(entry.name)) {
+            processedEntries.add(entry.name);
+            console.log('📹 Found video URL from Performance API:', entry.name);
+            this.captureVideoUrl(entry.name);
+          }
+        });
+      } catch (e) {
+        console.log('⚠️ Error checking performance entries:', e);
+      }
+    };
+    
+    // Check less frequently (every 5 seconds instead of 2)
+    setInterval(checkPerformanceEntries, 5000);
+    
+    // Also check when new entries are added (with debouncing)
+    let observerDebounceTimeout = null;
+    const performanceObserver = new PerformanceObserver((list) => {
+      if (observerDebounceTimeout) {
+        clearTimeout(observerDebounceTimeout);
+      }
+      observerDebounceTimeout = setTimeout(() => {
+        list.getEntries().forEach(entry => {
+          // Only process video CDN URLs and avoid duplicates
+          if (entry.name && this.isVideoCdnUrl(entry.name) && !processedEntries.has(entry.name)) {
+            processedEntries.add(entry.name);
+            console.log('📹 Found video URL from Performance Observer:', entry.name);
+            this.captureVideoUrl(entry.name);
+          }
+        });
+      }, 1000); // Debounce observer calls
+    });
+    
+    try {
+      performanceObserver.observe({ entryTypes: ['resource'] });
+    } catch (e) {
+      console.log('⚠️ Performance Observer not supported:', e);
+    }
+  }
+
+  /**
+   * Monitor video element's network activity
+   * Passive monitoring only - doesn't interfere with video loading
+   */
+  setupVideoNetworkMonitoring() {
+    // Track processed video sources to avoid duplicates
+    const processedVideoSources = new Set();
+    
+    // Listen for video elements loading (passive only)
+    document.addEventListener('loadedmetadata', (event) => {
+      if (event.target.tagName === 'VIDEO') {
+        const video = event.target;
+        const src = video.currentSrc || video.src;
+        
+        // Only process video CDN URLs and avoid duplicates
+        if (src && this.isVideoCdnUrl(src) && !src.startsWith('blob:') && !processedVideoSources.has(src)) {
+          processedVideoSources.add(src);
+          console.log('📹 Found video URL from loadedmetadata:', src);
+          this.captureVideoUrl(src);
         }
       }
-    } else {
-      console.log('✅ Refreshed video buttons');
+    }, true);
+    
+    // Listen for video source changes (passive only)
+    document.addEventListener('loadstart', (event) => {
+      if (event.target.tagName === 'VIDEO') {
+        const video = event.target;
+        const src = video.currentSrc || video.src;
+        
+        // Only process video CDN URLs and avoid duplicates
+        if (src && this.isVideoCdnUrl(src) && !src.startsWith('blob:') && !processedVideoSources.has(src)) {
+          processedVideoSources.add(src);
+          console.log('📹 Found video URL from loadstart:', src);
+          this.captureVideoUrl(src);
+        }
+      }
+    }, true);
+  }
+
+  /**
+   * Refresh buttons when media type changes (image to video)
+   * Only updates buttons, never modifies video elements
+   */
+  refreshButtonsOnMediaChange(post) {
+    // Debounce to prevent rapid calls
+    if (this.refreshButtonsTimeout) {
+      clearTimeout(this.refreshButtonsTimeout);
     }
+    
+    this.refreshButtonsTimeout = setTimeout(() => {
+      console.log('🔄 Refreshing buttons for media type change in post:', post);
+      
+      // Check for videos first (they take priority)
+      // Only read from video elements, never modify them
+      const videos = post.querySelectorAll('video');
+      const videoWrappers = post.querySelectorAll('.video-wrapper');
+      const videoPlayers = post.querySelectorAll('.video-js, [class*="videoPlayer-"]');
+      
+      let hasVideos = false;
+      let foundVideoUrl = false;
+      
+      // Check if any videos are actually present and visible
+      // Only extract URLs, never modify video elements
+      videos.forEach(video => {
+        // Only read from video, never modify
+        const videoUrl = this.extractVideoUrlFromElement(video);
+        if (videoUrl) {
+          hasVideos = true;
+          foundVideoUrl = true;
+          const parent = video.closest('.video-wrapper, .video-js, [class*="videoPlayer-"]') || video.parentElement;
+          if (parent) {
+            // Check if button already exists - don't recreate if it does
+            const existingButton = post.querySelector(`.${this.uniqueClass}`);
+            if (!existingButton) {
+              // Only create button if it doesn't exist, don't touch video
+              this.createVideoDownloadButton(parent, videoUrl);
+            }
+          }
+        }
+      });
+      
+      // Also check video wrappers and players
+      if ((videoWrappers.length > 0 || videoPlayers.length > 0) && !foundVideoUrl) {
+        // Try to extract from wrappers
+        videoWrappers.forEach(wrapper => {
+          const videoUrl = this.extractVideoUrl(wrapper, post);
+          if (videoUrl) {
+            foundVideoUrl = true;
+            const existingButton = post.querySelector(`.${this.uniqueClass}`);
+            if (!existingButton) {
+              this.createVideoDownloadButton(wrapper, videoUrl);
+            }
+          }
+        });
+        
+        // If still no URL, check networkVideoUrls for this post
+        if (!foundVideoUrl) {
+          const postId = post.getAttribute('data-id') || post.id;
+          if (postId) {
+            // Check if we have a captured video URL for this post
+            for (const [cleanUrl, data] of this.networkVideoUrls.entries()) {
+              if (data.url.includes(postId)) {
+                foundVideoUrl = true;
+                const existingButton = post.querySelector(`.${this.uniqueClass}`);
+                if (!existingButton) {
+                  console.log('✅ Using captured network video URL for post:', postId);
+                  this.createVideoDownloadButton(videoWrappers[0] || videoPlayers[0], data.url);
+                }
+                break;
+              }
+            }
+          }
+        }
+      }
+      
+      // Only remove and recreate buttons if we found a video URL and button doesn't exist
+      // OR if we're switching from images to videos
+      const existingButtons = post.querySelectorAll(`.${this.uniqueClass}`);
+      if (foundVideoUrl && existingButtons.length === 0) {
+        // Button should have been created above, but if not, try one more time
+        if (videoWrappers.length > 0 || videoPlayers.length > 0) {
+          this.handleVideoPlayers();
+        }
+      } else if (!hasVideos && !foundVideoUrl) {
+        // No videos found, check for images
+        const mediaToDownload = this.extractMediaFromPost(post);
+        if (mediaToDownload.length > 0) {
+          // Only remove buttons if we're switching to images
+          existingButtons.forEach(btn => btn.remove());
+          
+          const buttonContainer = this.createDownloadButtonContainer(mediaToDownload);
+          const toolsContainer = post.querySelector('.b-post__tools');
+          
+          if (toolsContainer) {
+            toolsContainer.appendChild(buttonContainer);
+            console.log('✅ Refreshed image buttons in tools container');
+          } else {
+            post.appendChild(buttonContainer);
+            console.log('✅ Refreshed image buttons in post (no tools container)');
+          }
+        }
+      } else if (foundVideoUrl && existingButtons.length > 0) {
+        console.log('✅ Video button already exists, keeping it');
+      } else {
+        console.log('⚠️ No video URL found, keeping existing buttons');
+      }
+    }, 300); // Debounce delay
   }
 
   /**
@@ -2807,6 +3869,26 @@ class OnlyFansDownloader {
                 target.classList?.contains('video-wrapper')) {
               shouldUpdate = true;
             }
+            // Check for active/current class changes in carousels (swipe detection)
+            if (target.classList && (target.classList.contains('active') || target.classList.contains('current'))) {
+              const post = target.closest('.b-post');
+              if (post) {
+                console.log('🔄 Active item changed in post, updating buttons...');
+                setTimeout(() => {
+                  this.updateButtonsForVisibleImage(post);
+                }, 200);
+              }
+            }
+            // Check for Swiper slide changes (swiper-slide-active class)
+            if (target.classList && target.classList.contains('swiper-slide-active')) {
+              const post = target.closest('.b-post');
+              if (post) {
+                console.log('🔄 Swiper slide changed in post, updating buttons...');
+                setTimeout(() => {
+                  this.updateButtonsForVisibleImage(post);
+                }, 200);
+              }
+            }
           }
         }
       });
@@ -2826,13 +3908,54 @@ class OnlyFansDownloader {
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ['class', 'aria-hidden']
+      attributeFilter: ['class', 'aria-hidden', 'style'],
+      attributeOldValue: true
     });
     
     // Store observer reference for cleanup
     this.mainObserver = mainObserver;
     
     console.log('✅ MutationObserver setup complete');
+  }
+
+  /**
+   * Update buttons for currently visible image in a post
+   */
+  updateButtonsForVisibleImage(post) {
+    // First, try to find the active Swiper slide
+    const swiper = post.querySelector('.swiper');
+    if (swiper) {
+      const activeSlide = swiper.querySelector('.swiper-slide-active');
+      if (activeSlide) {
+        const activeImage = activeSlide.querySelector('img.b-post__media__img');
+        if (activeImage) {
+          const allImages = post.querySelectorAll('img.b-post__media__img');
+          const currentIndex = Array.from(allImages).indexOf(activeImage);
+          if (currentIndex !== -1) {
+            console.log(`🔄 Swiper slide active, updating buttons for image ${currentIndex + 1}/${allImages.length}`);
+            this.updateButtonsForMediaIndex(post, currentIndex, allImages.length);
+            return;
+          }
+        }
+      }
+    }
+    
+    // Fallback: Find the currently visible image (not hidden)
+    const visibleImages = post.querySelectorAll('img.b-post__media__img:not([style*="display: none"])');
+    const allImages = post.querySelectorAll('img.b-post__media__img');
+    
+    if (visibleImages.length === 0 || allImages.length === 0) {
+      return;
+    }
+    
+    // Get the first visible image (current one being viewed)
+    const currentImage = visibleImages[0];
+    const currentIndex = Array.from(allImages).indexOf(currentImage);
+    
+    if (currentIndex !== -1) {
+      console.log(`🔄 Updating buttons for visible image ${currentIndex + 1}/${allImages.length}`);
+      this.updateButtonsForMediaIndex(post, currentIndex, allImages.length);
+    }
   }
 
   /**
@@ -2949,6 +4072,9 @@ class OnlyFansDownloader {
     if (mediaItems.length > 1) {
       console.log(`📸 Setting up multi-media handling for post with ${mediaItems.length} items`);
       
+      // Set up Swiper event listeners if Swiper is present
+      this.setupSwiperListenersForPost(post);
+      
       // Add click handlers to each media item
       mediaItems.forEach((mediaItem, index) => {
         mediaItem.addEventListener('click', () => {
@@ -2958,6 +4084,52 @@ class OnlyFansDownloader {
           }, 100);
         });
       });
+    }
+  }
+
+  /**
+   * Set up Swiper event listeners for a post with carousel
+   */
+  setupSwiperListenersForPost(post) {
+    const swiper = post.querySelector('.swiper');
+    if (!swiper) {
+      return;
+    }
+    
+    // Try to get Swiper instance from the element
+    // Swiper stores its instance on the element
+    let swiperInstance = null;
+    if (swiper.swiper) {
+      swiperInstance = swiper.swiper;
+    } else if (swiper.__swiper__) {
+      swiperInstance = swiper.__swiper__;
+    } else {
+      // Try to find Swiper instance by checking for swiper property on parent
+      const parent = swiper.parentElement;
+      if (parent && parent.swiper) {
+        swiperInstance = parent.swiper;
+      }
+    }
+    
+    if (swiperInstance) {
+      console.log('✅ Found Swiper instance, setting up slide change listener');
+      swiperInstance.on('slideChange', () => {
+        console.log('🔄 Swiper slide changed via event');
+        setTimeout(() => {
+          this.updateButtonsForVisibleImage(post);
+        }, 200);
+      });
+    } else {
+      // Fallback: Listen for transitionend events on swiper-wrapper
+      const swiperWrapper = swiper.querySelector('.swiper-wrapper');
+      if (swiperWrapper) {
+        swiperWrapper.addEventListener('transitionend', () => {
+          console.log('🔄 Swiper transition ended');
+          setTimeout(() => {
+            this.updateButtonsForVisibleImage(post);
+          }, 100);
+        });
+      }
     }
   }
 
@@ -3137,6 +4309,7 @@ class OnlyFansDownloader {
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', () => {
     const downloader = new OnlyFansDownloader();
+    window.onlyFansDownloaderInstance = downloader; // Store for network interception
     downloader.initialize();
     
     // Make debug methods available globally
